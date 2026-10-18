@@ -9,6 +9,7 @@ These rules preserve the user's requested behavior and lessons from previous fix
 - Create files only when the requested action actually needs them. Keep preparation and test artifacts in an allowed location and remove them when no longer needed. Do not create unsolicited backup versions, source duplicates, archives, compatibility links, exports, launchers, or distribution directories.
 - Install only the two required program files in `/opt`. Do not add `/usr/local/bin` links or duplicate the source checkout as an installation side effect. Documentation changes and source-copy requests do not authorize deployment or host configuration changes.
 - Opening the GUI, refreshing it, and inspecting status must be read-only. Do not create runtime state merely to display ownership. Create integration files only for the relevant setup/action, retain only ownership/restoration receipts in the relevant integration files, and reuse existing helpers instead of duplicating logic.
+- Data deduplication: do not store anything that can already be retrieved or derived from an existing authoritative source. Query that source when needed instead of maintaining duplicate configuration, status, metadata, or caches. Retain only information that cannot otherwise be recovered, such as original values needed to roll back a change.
 - Do not add dependencies without authorization. Do not add speculative `.gitignore` entries. Keep temporary and unrequested files out of commits; commit only the requested scope.
 
 ## GPU and host safety
