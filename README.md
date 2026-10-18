@@ -70,7 +70,7 @@ Open from your normal X11 session:
 | Xorg | Enable NVIDIA PRIME for host games |
 | A VM | Prepare and connect the GPU; install missing Debian drivers |
 
-Prepared VMs are listed before unprepared VMs. Unsupported VM architectures or transient definitions remain visible with an explanation. Select a destination and click **Connect**. The button is disabled for an already active destination with a working driver, or while an operation is in progress. If a connected guest’s NVIDIA driver is unavailable or cannot be verified, Connect remains available to finish Debian setup. Partial VM attachments can be completed through the same action.
+Prepared VMs are listed before unprepared VMs. Unsupported VM architectures or transient definitions remain visible with an explanation. Select a destination and click **Connect**. Ready VMs get a short connection confirmation without preparation warnings. The resizable confirmation wraps and scrolls its text while keeping action buttons visible. Driver installation is a separate checkbox, off by default for prepared VMs. The button is disabled for an already active destination with a working driver, or while an operation is in progress. If a connected guest’s NVIDIA driver is unavailable or cannot be verified, Connect remains available to finish Debian setup. Partial VM attachments can be completed through the same action.
 
 **Start without GPU** starts a selected shut-off VM with GPU-free startup settings. **Refresh** updates ownership and VM status. **Full cleanup…** opens application removal.
 
@@ -91,10 +91,10 @@ See [NVIDIA's Debian installation guide](https://docs.nvidia.com/datacenter/tesl
 For CLI setup, use the VM UUID with explicit preparation consent:
 
 ```sh
-sudo /opt/nvidia-handoff select VM_UUID --prepare-vm
+sudo /opt/nvidia-handoff select VM_UUID --prepare-vm --setup-driver
 ```
 
-Add `--shutdown-owner` only when you authorize a required graceful VM shutdown, and `--restart-session` only when you authorize an Xorg session restart. Host and guest changes outside the permitted filesystem scope must be reviewed and authorized before execution.
+`--prepare-vm` permits missing VM hardware setup; `--setup-driver` separately permits Debian driver installation and one guest reboot if needed. Omit both for a prepared VM when only connecting its GPU. Add `--shutdown-owner` only when you authorize a required graceful VM shutdown, and `--restart-session` only when you authorize an Xorg session restart. Host and guest changes outside the permitted filesystem scope must be reviewed and authorized before execution.
 
 The existing `enable-optional` command remains available for converting manually configured passthrough definitions to GPU-free ordinary startup without guest package changes:
 
@@ -172,5 +172,7 @@ Run isolated regression checks from the source directory:
 ```sh
 /usr/bin/python3 -I ./test_stateless.py
 ```
+
+For mapped dialog resize checks on an existing X11 display, run `NVIDIA_HANDOFF_GUI_TESTS=1 /usr/bin/python3 -I ./test_stateless.py`; these cover 96, 144, and 192 DPI.
 
 Tests use synthetic devices and integration files inside the checkout. They do not change host drivers, services, or VMs.

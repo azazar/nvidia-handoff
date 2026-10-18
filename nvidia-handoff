@@ -655,6 +655,8 @@ def inventory(check_drivers=False):
         target = [entry for entry in candidates if entry[0] in BDFS]
         prepared = (bool(optional) and len(target) == len(BDFS) and {e[0] for e in target} == set(BDFS))
         supported = persistent and h is not None and h.guest_supported(root)
+        if prepared and supported:
+            prepared = ET.tostring(ET.fromstring(h.prepare_guest_xml(ET.tostring(root, encoding='unicode')))) == ET.tostring(root)
         missing = len(set(BDFS) - {e[0] for e in live})
         needs_restart = (state == 'running' and missing > 0 and
                          (h.hotplug_capacity(live_root) < missing or not h.agent_channel(live_root)))
@@ -717,7 +719,7 @@ def operation_status(h, job, state, message, target):
                              'target': target, 'gpu': GPU, 'time': time.time()}, mode=0o644)
 
 
-def selection_worker(target, job, shutdown, restart, prepare_vm=False):
+def selection_worker(target, job, shutdown, restart, prepare_vm=False, setup_driver=False):
     if os.geteuid() != 0:
         raise Error('Administrator authentication required')
     h = load_hook()
@@ -733,7 +735,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False):
         selected = next((d for d in records if d['uuid'] == target), None)
         if selected and not selected.get('optional') and not prepare_vm:
             raise Error('Use Connect or select --prepare-vm to authorize automatic Debian VM setup.')
-        if prepare_vm and selected and selected['state'] == 'running' and not selected.get('needs_restart'):
+        if setup_driver and selected and selected['state'] == 'running' and not selected.get('needs_restart'):
             debian_guest(target)
         if stops and not shutdown:
             raise Error('Switching requires permission to shut down the current VM gracefully.')
@@ -748,7 +750,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False):
                 h.choose_target(target)
             finally:
                 os.close(fd)
-            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            detail = setup_guest_driver(target, job, target) if setup_driver else ''
             operation_status(h, job, 'done', 'GPU is already attached to ' + selected['name'] + ('. ' + detail if detail else ''), target)
             return
         fd = h.lock()
@@ -771,7 +773,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False):
         owners = [d for d in inventory() if d['live_gpu']]
         if owners and all(d['uuid'] == target for d in owners):
             attach_running(target)
-            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            detail = setup_guest_driver(target, job, target) if setup_driver else ''
             operation_status(h, job, 'done', 'GPU attachment completed. ' + detail, target)
             return
         if owners:
@@ -809,7 +811,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False):
         current = next((d for d in inventory() if d['uuid'] == target), None)
         if current and current.get('optional') and current['state'] == 'running':
             attach_running(target)
-            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            detail = setup_guest_driver(target, job, target) if setup_driver else ''
             operation_status(h, job, 'done', 'GPU attached to running VM ' + current['name'] + ('. ' + detail if detail else ''), target)
             return
         fd = h.lock()
@@ -834,7 +836,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False):
             actual = next(d for d in inventory() if d['uuid'] == target)
             if set(actual['live_gpu']) != set(BDFS):
                 raise Error('VM started without the GPU because it could not be claimed safely; no guest packages were changed.')
-            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            detail = setup_guest_driver(target, job, target) if setup_driver else ''
             message = 'GPU attached to VM ' + current['name'] + ('. ' + detail if detail else '')
         else:
             message = 'GPU is idle, without a VM or Xorg attachment.'
@@ -844,7 +846,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False):
         raise
 
 
-def select_destination(target, job, shutdown, restart, prepare_vm=False):
+def select_destination(target, job, shutdown, restart, prepare_vm=False, setup_driver=False):
     if target not in ('none', 'xorg', 'cuda') and str(uuid.UUID(target)) != target:
         raise Error('Invalid target UUID')
     if str(uuid.UUID(job)) != job:
@@ -859,6 +861,8 @@ def select_destination(target, job, shutdown, restart, prepare_vm=False):
     args = program_command('--selection-worker', target, '--job-id', job)
     if prepare_vm:
         args.append('--prepare-vm')
+    if setup_driver:
+        args.append('--setup-driver')
     caller = os.environ.get('PKEXEC_UID')
     if caller:
         status_file(int(caller), job)
@@ -930,6 +934,97 @@ def row_summary(row, current=None):
     if not row[4]:
         return row[3].split(';', 1)[0] + ' · GPU setup required'
     return row[3]
+
+
+def switch_confirmation(label, selected, stops, restart, install_driver):
+    lines = ['Connect GPU to ' + label + '.']
+    if selected:
+        lines.append(('Start this VM with the GPU for this run.' if selected['state'] == 'shut off'
+                      else 'Attach the GPU to the running VM.') + ' Ordinary starts remain GPU-free.')
+        if not selected.get('prepared', selected.get('optional', False)):
+            lines.append('Add missing GPU templates, PCI controllers and guest-agent channel to this VM. '
+                         'Libvirt saves the definition under /etc/libvirt/qemu/.')
+        if install_driver:
+            lines.append('Verify Debian 12/13 through the guest agent. Install NVIDIA drivers only if missing, '
+                         'using the signed NVIDIA APT repository if needed. This accepts the NVIDIA driver license '
+                         'and permits one graceful guest reboot.')
+            lines.append('Guest package changes: /etc/apt, /usr, /lib, /boot, /var, /run and /tmp.')
+    if stops:
+        lines.append('Gracefully shut down: ' + ', '.join(d['name'] for d in stops) + '.')
+    if restart:
+        lines.append('Restart the login manager; graphical sessions will end. Save your work first.')
+    lines.append('Handoff updates selected GPU bindings under /sys/bus/pci/, selected /dev access permissions '
+                 'and recovery files under /run/. Normal VM operation updates its disks and libvirt runtime/log files.')
+    return '\n\n'.join(lines)
+
+
+class SwitchDialog:
+    """Resizable confirmation with a fixed footer and naturally wrapping text."""
+    def __init__(self, parent, text_for_driver, offer_driver=False, default_driver=False):
+        import tkinter as tk
+        from tkinter import ttk
+        self.window = window = tk.Toplevel(parent)
+        window.title('Switch GPU')
+        window.transient(parent)
+        scale = parent.winfo_fpixels('1i') / 96
+        px = lambda n: max(1, round(n * scale))
+        self.result = (False, False)
+        self.install_driver = tk.BooleanVar(window, value=default_driver)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        content = ttk.Frame(window, padding=px(16))
+        content.grid(row=0, column=0, sticky='nsew')
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+        self.text = tk.Text(content, wrap='word', width=1, height=1, font='TkDefaultFont',
+                            borderwidth=0, highlightthickness=0, padx=px(8), pady=px(8))
+        self.text.grid(row=0, column=0, sticky='nsew')
+        scrollbar = ttk.Scrollbar(content, orient='vertical', command=self.text.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        self.text.configure(yscrollcommand=scrollbar.set)
+        def refresh():
+            self.text.configure(state='normal')
+            self.text.delete('1.0', 'end')
+            self.text.insert('1.0', text_for_driver(self.install_driver.get()))
+            self.text.configure(state='disabled')
+        if offer_driver:
+            ttk.Checkbutton(window, text='Install missing Debian NVIDIA drivers',
+                            variable=self.install_driver, command=refresh).grid(
+                                row=1, column=0, sticky='w', padx=px(24), pady=(0, px(8)))
+        buttons = ttk.Frame(window, padding=(px(16), px(8), px(16), px(16)))
+        buttons.grid(row=2, column=0, sticky='ew')
+        buttons.columnconfigure(0, weight=1)
+        self.connect_button = ttk.Button(buttons, text='Connect', style='Handoff.TButton', command=self.accept)
+        self.connect_button.grid(row=0, column=1, padx=(0, px(10)))
+        self.cancel_button = ttk.Button(buttons, text='Cancel', style='Handoff.TButton', command=self.cancel)
+        self.cancel_button.grid(row=0, column=2)
+        window.protocol('WM_DELETE_WINDOW', self.cancel)
+        window.bind('<Escape>', lambda event: self.cancel())
+        window.bind('<Return>', lambda event: self.accept())
+        refresh()
+        width = min(px(760), round(window.winfo_screenwidth() * .85))
+        height = min(px(460 if offer_driver else 340), round(window.winfo_screenheight() * .8))
+        window.minsize(min(width, px(460)), min(height, px(250)))
+        window.update_idletasks()
+        x = max(0, min(parent.winfo_rootx() + (parent.winfo_width() - width)//2,
+                       window.winfo_screenwidth() - width))
+        y = max(0, min(parent.winfo_rooty() + (parent.winfo_height() - height)//2,
+                       window.winfo_screenheight() - height))
+        window.geometry(f'{width}x{height}+{x}+{y}')
+
+    def accept(self):
+        self.result = (True, self.install_driver.get())
+        self.window.destroy()
+
+    def cancel(self):
+        self.window.destroy()
+
+    def show(self):
+        self.window.wait_visibility()
+        self.window.grab_set()
+        self.cancel_button.focus_set()
+        self.window.wait_window()
+        return self.result
 
 
 class GPUWindow:
@@ -1101,24 +1196,20 @@ class GPUWindow:
             messagebox.showerror('Cannot switch GPU', str(exc), parent=self.root)
             return
         label = self.rows[target][1]
-        vm_target = target not in ('none', 'xorg', 'cuda')
-        changes = ['Attach GPU to: ' + label + '.']
-        if vm_target:
-            changes.append('Prepare missing GPU templates, PCI controllers and guest-agent channel in the selected VM definition. Ordinary starts remain GPU-free.')
-            changes.append('Use the existing QEMU guest agent to verify Debian 12/13 and install missing NVIDIA drivers. If needed, add NVIDIA’s signed APT repository and reboot this guest once. This accepts the NVIDIA driver license.')
-            changes.append('Guest package changes affect /etc/apt, /usr, /lib, /boot and /var (APT, dpkg and DKMS); the VM definition is saved by libvirt under /etc/libvirt/qemu. Host integration may use /etc/libvirt/hooks/qemu.d, /etc/X11/xorg.conf.d and /etc/wireplumber, and /run for handoff safety state.')
-        if stops:
-            changes.append('VMs to shut down gracefully: ' + ', '.join(d['name'] for d in stops) + '.')
-        if restart:
-            changes.append('Graphical sessions will end. Save your work before continuing.')
-        if target not in ('none', 'xorg', 'cuda') and stops:
-            changes.append('The selected VM will start after the GPU is released.')
-        if not messagebox.askokcancel('Switch GPU', '\n\n'.join(changes), parent=self.root):
+        record = self.selected_vm()
+        needs_preparation = bool(record and not record.get('prepared', record.get('optional', False)))
+        offer_driver = bool(record and record.get('driver_ready') is not True)
+        confirmed, install_driver = SwitchDialog(self.root,
+            lambda install: switch_confirmation(label, record, stops, restart, install),
+            offer_driver=offer_driver, default_driver=needs_preparation).show()
+        if not confirmed:
             return
         self.job = str(uuid.uuid4())
         args = ['/usr/bin/pkexec', '--disable-internal-agent', *program_command('select', target, '--job-id', self.job)]
-        if vm_target:
+        if needs_preparation:
             args.append('--prepare-vm')
+        if install_driver:
+            args.append('--setup-driver')
         if stops:
             args.append('--shutdown-owner')
         if restart:
@@ -1776,7 +1867,8 @@ def main(argv):
         parser.add_argument('--status-uid', type=int)
         parser.add_argument('--shutdown-owner', action='store_true')
         parser.add_argument('--restart-session', action='store_true')
-        parser.add_argument('--prepare-vm', action='store_true', help='Authorize VM hardware setup, Debian driver packages and one guest reboot if required')
+        parser.add_argument('--prepare-vm', action='store_true', help='Authorize missing VM hardware preparation')
+        parser.add_argument('--setup-driver', action='store_true', help='Check/install Debian guest NVIDIA drivers; permit one guest reboot if needed')
         # Internal worker uses an option-shaped token; remove it before argparse.
         args = parser.parse_args((['worker'] + argv[1:]) if argv[0] == '--selection-worker' else argv)
         job = args.job_id or str(uuid.uuid4())
@@ -1786,7 +1878,7 @@ def main(argv):
                 raise Error('Internal progress option requires root worker')
             OP_STATUS = status_file(args.status_uid, job)
         fn = selection_worker if args.mode == 'worker' else select_destination
-        return fn(args.target, job, args.shutdown_owner, args.restart_session, args.prepare_vm)
+        return fn(args.target, job, args.shutdown_owner, args.restart_session, args.prepare_vm, args.setup_driver)
     if len(argv) == 2 and argv[0] == '--worker' and argv[1] in ('connect', 'disconnect'):
         return worker(argv[1])
     if argv[:1] == ['run']:

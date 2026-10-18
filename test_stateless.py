@@ -593,7 +593,7 @@ class StatelessTests(unittest.TestCase):
         self.app.start_optional=start
         self.app.setup_guest_driver=driver
         with patch.object(os,'geteuid',return_value=0),patch.object(os,'close',release):
-            self.app.selection_worker('vm','job',False,False,True)
+            self.app.selection_worker('vm','job',False,False,True,True)
         self.assertEqual(events,['prepare','start','driver'])
 
     def test_guest_exec_timeout_reports_pid_without_killing_process(self):
@@ -662,7 +662,7 @@ class StatelessTests(unittest.TestCase):
             return 'ready'
         self.app.setup_guest_driver=Mock(side_effect=driver)
         with patch.object(os,'geteuid',return_value=0),patch.object(os,'close',release):
-            self.app.selection_worker('vm','job',False,False,True)
+            self.app.selection_worker('vm','job',False,False,True,True)
         self.app.setup_guest_driver.assert_called_once()
         self.app.worker.assert_not_called()
 
@@ -678,6 +678,85 @@ class StatelessTests(unittest.TestCase):
         d['driver_ready']=True
         self.app.GPUWindow.show_inventory(window,[d],False,'vfio-pci')
         self.assertEqual(window.current_target,'vm')
+
+
+    def test_ready_vm_confirmation_has_no_preparation_or_package_warning(self):
+        d=dict(state='shut off',prepared=True,optional=True)
+        text=self.app.switch_confirmation('ready',d,[],False,False)
+        self.assertIn('Start this VM',text)
+        self.assertNotIn('templates',text)
+        self.assertNotIn('/etc/libvirt/qemu',text)
+        self.assertNotIn('APT',text)
+        self.assertNotIn('reboot',text)
+
+    def test_unprepared_vm_confirmation_lists_hardware_but_driver_requires_consent(self):
+        d=dict(state='shut off',prepared=False,optional=False)
+        text=self.app.switch_confirmation('new',d,[],False,False)
+        self.assertIn('GPU templates',text)
+        self.assertNotIn('driver license',text)
+        text=self.app.switch_confirmation('new',d,[],False,True)
+        self.assertIn('driver license',text)
+        self.assertIn('one graceful guest reboot',text)
+
+    def test_gui_prepared_vm_dispatch_omits_setup_options_by_default(self):
+        self.configure_guest_devices()
+        record=dict(uuid='vm',name='ready',state='shut off',eligible=True,prepared=True,
+                    optional=True,live_gpu=[],driver_ready=None)
+        window=types.SimpleNamespace(tree=Mock(),busy=False,current_target='cuda',records=[record],
+            attached=False,rows={'vm':('vm','ready','Virtual machine','',True)},
+            root=Mock(),selected_vm=lambda:record,progress=Mock(),update_button=Mock())
+        window.tree.selection.return_value=('vm',)
+        self.app.SwitchDialog=Mock()
+        self.app.SwitchDialog.return_value.show.return_value=(True,False)
+        self.app.subprocess.Popen=Mock()
+        self.app.GPUWindow.apply(window)
+        args=self.app.subprocess.Popen.call_args.args[0]
+        self.assertNotIn('--prepare-vm',args)
+        self.assertNotIn('--setup-driver',args)
+        self.assertFalse(self.app.SwitchDialog.call_args.kwargs['default_driver'])
+
+
+    @unittest.skipUnless(os.environ.get('NVIDIA_HANDOFF_GUI_TESTS') == '1', 'Enable mapped display checks explicitly')
+    def test_confirmation_dialog_resizes_at_96_144_192_dpi(self):
+        import tkinter as tk
+        import tkinter.font as fonts
+        import time
+        root=tk.Tk()
+        self.addCleanup(root.destroy)
+        root.geometry('700x500+10+10')
+        root.update()
+        for dpi in (96,144,192):
+            with self.subTest(dpi=dpi):
+                root.tk.call('tk','scaling',dpi/72)
+                fonts.nametofont('TkDefaultFont',root=root).configure(size=11)
+                dialog=self.app.SwitchDialog(root,lambda install:'A long confirmation paragraph for wrapping and scrolling. '*150,
+                                             offer_driver=True,default_driver=False)
+                root.update()
+                self.assertTrue(dialog.window.winfo_ismapped())
+                sizes=[(dialog.window.winfo_width(),dialog.window.winfo_height()),
+                       tuple(dialog.window.minsize())]
+                sizes.append((min(sizes[0][0]+200,root.winfo_screenwidth()-50),sizes[0][1]+80))
+                widths=[]
+                for width,height in sizes:
+                    dialog.window.geometry(f'{width}x{height}+30+30')
+                    root.update()
+                    time.sleep(.1)
+                    root.update()
+                    w,h=dialog.window.winfo_width(),dialog.window.winfo_height()
+                    x,y=dialog.window.winfo_rootx(),dialog.window.winfo_rooty()
+                    for widget in (dialog.text,dialog.connect_button,dialog.cancel_button):
+                        self.assertGreaterEqual(widget.winfo_rootx(),x)
+                        self.assertGreaterEqual(widget.winfo_rooty(),y)
+                        self.assertLessEqual(widget.winfo_rootx()+widget.winfo_width(),x+w)
+                        self.assertLessEqual(widget.winfo_rooty()+widget.winfo_height(),y+h)
+                    widths.append(dialog.text.winfo_width())
+                self.assertGreater(widths[2],widths[1])
+                self.assertEqual(dialog.text.cget('wrap'),'word')
+                dialog.text.yview_moveto(1)
+                root.update()
+                self.assertGreater(dialog.text.yview()[0],0)
+                dialog.cancel()
+                root.update()
 
 
 
