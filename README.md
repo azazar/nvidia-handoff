@@ -2,6 +2,8 @@
 
 Share a displayless secondary NVIDIA GPU between CUDA applications, host games, and libvirt virtual machines. The primary GPU runs the desktop.
 
+**Disclosure:** This project and its documentation were written with Codex.
+
 ## Features
 
 - **GPU destinations:** idle, CUDA without Xorg, Xorg with NVIDIA PRIME, or a virtual machine.
