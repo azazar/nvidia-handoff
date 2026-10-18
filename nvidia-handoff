@@ -1,0 +1,1573 @@
+#!/usr/bin/python3 -I
+"""Safely hand off a displayless secondary NVIDIA GPU to CUDA, X11 or libvirt.
+
+connect/disconnect require --restart-session: the login manager restarts and logs out users.
+GUI can request graceful VM shutdown after confirmation.
+VM startup: start-vm NAME [--without-gpu].
+Full uninstall: --cleanup [--dry-run] [--yes].
+Debian with systemd, NVIDIA driver and X.Org or XLibre; Wayland is refused.
+"""
+import argparse
+import hashlib
+import json
+import queue
+import threading
+import uuid
+import xml.etree.ElementTree as ET
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+import types
+import shutil
+
+SETTINGS_PATH = Path('/etc/nvidia-handoff.json')
+SETTINGS = {}
+BDFS = ()
+GPU = None
+LABEL = 'NVIDIA GPU'
+UNIT = 'nvidia-handoff.service'
+CONFIG = None
+OP_STATUS = None
+
+
+class Error(RuntimeError):
+    pass
+
+
+def run(*args):
+    p = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, timeout=35, env={**os.environ, 'LC_ALL': 'C'})
+    if p.returncode:
+        raise Error(p.stderr.strip() or f'{args[0]} failed ({p.returncode})')
+    return p.stdout.strip()
+
+
+def initialize():
+    global SETTINGS, BDFS, GPU, LABEL, CONFIG
+    validate_root_file(SETTINGS_PATH)
+    SETTINGS = json.loads(SETTINGS_PATH.read_text())
+    h = load_core()
+    h.configure(SETTINGS)
+    BDFS, GPU = h.DEVICES, h.GPU
+    LABEL, CONFIG = SETTINGS.get('label', 'NVIDIA GPU'), h.XORG_CONFIG
+
+
+def validate_root_file(path):
+    for p in (path.parent, path):
+        st = p.lstat()
+        if st.st_uid != 0 or st.st_mode & 0o022 or stat.S_ISLNK(st.st_mode):
+            raise Error('Unsafe ownership/permissions: ' + str(p))
+    if not path.is_file():
+        raise Error('Expected regular file: ' + str(path))
+
+
+def load_core(trusted=True):
+    path = Path(__file__).resolve().with_name('nvidia_handoff_core.py')
+    if trusted:
+        validate_root_file(path)
+    h = types.ModuleType('nvidia_handoff_core')
+    exec(compile(path.read_bytes(), str(path), 'exec'), h.__dict__)
+    return h
+
+
+def require_stopped():
+    owners = [d['name'] for d in inventory() if d['live_gpu']]
+    if owners:
+        raise Error('GPU belongs to active VM: ' + ', '.join(owners) + '. Shut it down first.')
+
+
+def pci_driver(bdf):
+    p = Path('/sys/bus/pci/devices') / bdf / 'driver'
+    return p.resolve(strict=True).name if p.is_symlink() else 'unbound'
+
+
+def providers():
+    if not os.environ.get('DISPLAY'):
+        raise Error('Run this command from the graphical Xorg session.')
+    return run('/usr/bin/xrandr', '--listproviders')
+
+
+def nvidia_provider(text):
+    for line in text.splitlines():
+        m = re.search(r'name:(NVIDIA[^\n]+)$', line)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def status():
+    h = load_hook()
+    print(LABEL, GPU)
+    print('X11 session check:', end=' ')
+    h.assert_x11()
+    print('passed')
+    print('IOMMU isolation:', h.isolated())
+    for b in BDFS:
+        print(b + ':', pci_driver(b))
+    for d in inventory():
+        if d['pci']:
+            print('VM:', d['name'], d['state'], 'eligible=' + str(d['eligible']), 'live=' + str(d['live_gpu']))
+    print(CONFIG.read_text().strip() if CONFIG.exists() else 'Xorg integration not needed yet.')
+    if os.environ.get('DISPLAY'):
+        print(providers())
+
+
+def load_hook():
+    h = load_core()
+    h.configure(SETTINGS)
+    return h
+
+
+def atomic_config(data):
+    s = CONFIG.lstat()
+    if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o022:
+        raise Error('Unsafe Xorg configuration ownership/permissions')
+    tmp = CONFIG.with_name('.' + CONFIG.name + '.nvidia-handoff.new')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+            os.fchown(out.fileno(), s.st_uid, s.st_gid)
+            os.fchmod(out.fileno(), stat.S_IMODE(s.st_mode))
+        os.replace(tmp, CONFIG)
+        SETTINGS['xorg_applied_mode'] = re.findall(rb'(?im)^\s*Option\s+"AutoAddGPU"\s+"(off|on)"\s*$', data)[0].decode().lower()
+        if str(CONFIG) in SETTINGS.get('managed_files', {}):
+            SETTINGS['managed_files'][str(CONFIG)] = digest(data)
+        write_file(SETTINGS_PATH, (json.dumps(SETTINGS, indent=2) + '\n').encode())
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def xorg_processes(h):
+    result = set()
+    for p in h.PROC.iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            if (p / 'comm').read_text().strip().lower() in ('xorg', 'xlibre'):
+                result.add(p.name)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return result
+
+
+def xorg_owners(h):
+    nodes = {p for p in h.host_nodes() if p.parent.name != 'snd'}
+    rdevs = {p.stat().st_rdev for p in nodes}
+    owners = set()
+    for pid in xorg_processes(h):
+        try:
+            for fd in (h.PROC / pid / 'fd').iterdir():
+                try:
+                    s = fd.stat()
+                    if stat.S_ISCHR(s.st_mode) and s.st_rdev in rdevs:
+                        owners.add(pid)
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return owners
+
+
+def wait_xorg(h, old, gaming):
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        h.assert_x11()
+        current = xorg_processes(h)
+        if current and current.isdisjoint(old) and bool(xorg_owners(h)) == gaming:
+            return
+        time.sleep(0.5)
+    raise Error('Xorg did not reach the expected GPU mode; transition interlock retained.')
+
+
+def restore_host(h):
+    s = h.load()
+    if s is not None:
+        h.release()
+    if any(h.driver(b) != h.HOST[b] for b in h.DEVICES):
+        # Recover manually detached, idle VFIO devices when no lifecycle state remains.
+        s = h.transaction(h.snapshot())
+        s['phase'] = 'vfio'
+        h.save(s)
+        h.restore(s)
+    if any(h.driver(b) != h.HOST[b] for b in h.DEVICES):
+        raise Error('Host driver binding verification failed')
+
+
+def worker(mode, preserve_policy=False):
+    if os.geteuid() != 0:
+        raise Error('The switch worker requires administrator authentication.')
+    ensure_integration()
+    h = load_hook()
+    h.assert_x11()
+    require_stopped()  # Libvirt query OUTSIDE the GPU lock.
+    fd = h.lock()
+    marker = h.STATE_DIR / 'xorg-transition'
+    original = None
+    changed = False
+    try:
+        h.topology()
+        h.idle(h.vfio_nodes())
+        current = h.xorg_mode()
+        owners = xorg_owners(h)
+        wanted = 'on' if mode == 'connect' else 'off'
+        if current == wanted and bool(owners) == (mode == 'connect'):
+            if mode == 'connect' and not xorg_processes(h):
+                raise Error('No X11 server is running.')
+            marker.unlink(missing_ok=True)
+            if not preserve_policy:
+                h.choose_target('xorg' if mode == 'connect' else None)
+            return
+        if mode == 'disconnect' and h.driver(GPU) == 'nvidia' and h.shared_nvidia_driver():
+            raise Error('Cannot safely distinguish X11 ownership while another NVIDIA GPU shares the host driver.')
+        manager = h.display_manager()  # Resolve before changing anything.
+        if mode == 'connect' and h.shared_nvidia_driver():
+            raise Error('Another NVIDIA GPU shares the host driver; automatic X11 attachment is ambiguous.')
+        marker.write_text(mode + '\n')
+        os.chmod(marker, 0o600)
+        if mode == 'connect':
+            restore_host(h)
+            h.run('/usr/sbin/modprobe', 'nvidia_drm')
+            h.topology()  # Connectors become visible only after binding; refuse displays.
+        original = CONFIG.read_bytes()
+        text, count = re.subn(r'(?im)^(\s*Option\s+"AutoAddGPU"\s+")(?:off|on)("\s*)$',
+                              lambda m: m.group(1) + wanted + m.group(2), original.decode())
+        if count != 1:
+            raise Error('Expected one AutoAddGPU off/on option')
+        old = xorg_processes(h)
+        atomic_config(text.encode())
+        changed = True
+        print('Restarting ' + manager + '; graphical sessions will end.', flush=True)
+        # Marker prevents hook prepare while restart runs. Never hold the lock across a DM dependency.
+        os.close(fd)
+        fd = None
+        h.run('/usr/bin/systemctl', 'restart', manager)
+        wait_xorg(h, old, mode == 'connect')
+        fd = h.lock()
+        marker.unlink(missing_ok=True)
+        if not preserve_policy:
+            h.choose_target('xorg' if mode == 'connect' else None)
+        h.log('X11 GPU mode: ' + mode)
+    except BaseException:
+        if fd is None:
+            fd = h.lock()
+        if changed and original is not None:
+            atomic_config(original)
+        if marker.exists():
+            print('Switch failed. Configuration restored; GPU protected by transition marker. '
+                  'Use disconnect --restart-session to recover.', file=sys.stderr, flush=True)
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def switch(mode, restart):
+    if not restart:
+        raise Error('This ends graphical sessions managed by the login manager. Save your work, then add --restart-session.')
+    require_stopped()  # Refuse a running VM before prompting for a password.
+    if os.geteuid() != 0:
+        print('Administrator authentication is needed to switch Xorg mode.', flush=True)
+        os.execv('/usr/bin/sudo', ['sudo', '/usr/bin/python3', '-I', str(Path(__file__).resolve()), mode, '--restart-session'])
+    load_hook()  # Fail before scheduling if the installed interlock is unavailable.
+    run('/usr/bin/systemd-run', '--unit=nvidia-handoff', '--collect', '--property=Type=exec',
+        '/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--worker', mode)
+    print('Switch scheduled. The login manager will log out this session. Log: sudo journalctl -u ' + UNIT)
+
+
+def launch(command):
+    if os.geteuid() == 0:
+        raise Error('Launch games as your normal user.')
+    load_hook().assert_x11(need_display=True)
+    require_stopped()
+    if pci_driver(GPU) != 'nvidia':
+        raise Error('GPU is not attached to the host; connect it first.')
+    if load_hook().shared_nvidia_driver():
+        raise Error('Multiple host NVIDIA GPUs: automatic PRIME provider selection is ambiguous.')
+    provider = nvidia_provider(providers())
+    if not provider:
+        raise Error('No NVIDIA X11 provider. Use connect --restart-session after saving work.')
+    if command[:1] == ['--']:
+        command = command[1:]
+    if not command:
+        raise Error('Specify the game/application after /opt/nvidia-handoff run.')
+    os.environ.update(__NV_PRIME_RENDER_OFFLOAD='1', __GLX_VENDOR_LIBRARY_NAME='nvidia',
+                      __NV_PRIME_RENDER_OFFLOAD_PROVIDER=provider, __VK_LAYER_NV_optimus='NVIDIA_only')
+    os.execvp(command[0], command)
+
+
+
+def virsh_input(xml, *args):
+    result = subprocess.run(['/usr/bin/virsh', '-c', 'qemu:///system', *args],
+                            input=xml, capture_output=True, text=True, timeout=60,
+                            env={**os.environ, 'LC_ALL': 'C'})
+    if result.returncode:
+        raise Error(result.stderr.strip() or 'libvirt operation failed')
+    return result.stdout.strip()
+
+
+def optional_templates(ident):
+    h = load_hook()
+    root = ET.fromstring(virsh('dumpxml', '--inactive', ident))
+    return h, root, h.optional_devices(root)
+
+
+def enable_optional_guests():
+    if os.geteuid() != 0:
+        raise Error('Administrator authentication required')
+    h = load_hook()
+    ensure_integration(vm=True)
+    for ident in virsh('list', '--all', '--uuid').split():
+        if str(uuid.UUID(ident)) != ident:
+            raise Error('Unexpected domain UUID')
+        info = virsh('dominfo', ident)
+        if not re.search(r'^Persistent:\s+yes$', info, re.M):
+            continue
+        xml = virsh('dumpxml', '--inactive', ident)
+        changed = h.enable_optional_xml(xml)
+        if changed is None:
+            continue
+        # Outside the GPU lock and outside a libvirt hook. Live devices remain untouched.
+        virsh_input(changed, 'define', '/dev/stdin', '--validate')
+        print('Enabled optional GPU for ' + ET.fromstring(xml).findtext('name'), flush=True)
+
+
+def mark_claim(h, ident):
+    state = h.load()
+    if state is None:
+        raise Error('GPU reservation disappeared')
+    state.update(claim_pid=os.getpid(), claim_start=h.process_start(os.getpid()), claim_uuid=ident)
+    h.save(state)
+
+
+def finish_claim(h):
+    state = h.load()
+    if state is not None and state.get('claim_pid') == os.getpid():
+        for key in ('claim_pid', 'claim_start', 'claim_uuid'):
+            state.pop(key, None)
+        h.save(state)
+
+
+def attach_running(ident):
+    h, root, templates = optional_templates(ident)
+    if not templates:
+        raise Error('Optional GPU templates are missing')
+    records = inventory()
+    selected = next((d for d in records if d['uuid'] == ident), None)
+    if selected is None or selected['state'] != 'running':
+        raise Error('Live GPU attachment requires a running guest')
+    if set(selected['live_gpu']) == set(BDFS):
+        return
+    fd = h.lock()
+    try:
+        h.assert_x11()
+        if any(d['live_gpu'] for d in records if d['uuid'] != ident):
+            raise Error('GPU belongs to another guest; no live attachment performed')
+        if h.xorg_mode() != 'off' or (h.STATE_DIR / 'xorg-transition').exists():
+            raise Error('X11 owns/reserves the GPU; no live attachment performed')
+        state = h.load()
+        if not (state and state.get('uuid') == ident and state['phase'] == 'vfio' and selected['live_gpu']):
+            # Atomic safe claim. Busy CUDA/graphics checks run before any driver mutation.
+            h.park()
+            h.VM, h.UUID = selected['name'], ident
+            h.choose_target(ident)
+            h.prepare()
+        elif any(h.driver(b) != 'vfio-pci' for b in BDFS):
+            raise Error('Partial GPU assignment has unexpected driver bindings')
+        mark_claim(h, ident)
+    finally:
+        os.close(fd)
+    try:
+        # Do not hold the shared GPU lock across libvirt calls.
+        for dev in templates:
+            live = next(d for d in inventory() if d['uuid'] == ident)['live_gpu']
+            _, entries = pci_entries('<domain><devices>' + ET.tostring(dev, encoding='unicode') + '</devices></domain>')
+            if entries[0][0] not in live:
+                virsh_input(ET.tostring(dev, encoding='unicode'), 'attach-device', ident, '/dev/stdin', '--live')
+        current = next(d for d in inventory() if d['uuid'] == ident)
+        if set(current['live_gpu']) != set(BDFS):
+            raise Error('Live GPU assignment did not complete')
+        h.log('Optional GPU attached live to ' + selected['name'])
+    except BaseException:
+        current = next((d for d in inventory() if d['uuid'] == ident), None)
+        if current is not None and not current['live_gpu']:
+            fd = h.lock()
+            try:
+                h.VM, h.UUID = selected['name'], ident
+                h.release()
+            finally:
+                os.close(fd)
+        else:
+            h.log('Partial live GPU attachment retained; no forced unplug. Guest remains running.', True)
+        raise
+    finally:
+        fd = h.lock()
+        try:
+            finish_claim(h)
+        finally:
+            os.close(fd)
+
+
+def start_optional(ident, without_gpu=False):
+    h, root, templates = optional_templates(ident)
+    if virsh('domstate', ident) != 'shut off':
+        raise Error('Guest is not shut off')
+    if re.search(r'^Managed save:\s+yes$', virsh('dominfo', ident), re.M):
+        raise Error('VM has saved memory. Resume or discard it explicitly in virt-manager before a fresh boot.')
+    xml = ET.tostring(root, encoding='unicode')
+    if any(bdf in BDFS for bdf, _ in pci_entries(xml)[1]):
+        raise Error('Persistent VM configuration still includes this GPU. Enable optional GPU setup first.')
+    if without_gpu:
+        virsh_input(h.boot_xml(xml, False) if templates else xml, 'create', '/dev/stdin', '--validate')
+        return
+    if not templates:
+        raise Error('VM has no optional GPU template. Enable optional GPU setup first.')
+    ensure_integration(vm=True)
+    with_gpu = False
+    fd = h.lock()
+    try:
+        if h.policy_target() in (None, ident) and h.xorg_mode() == 'off':
+            try:
+                h.park()
+                h.choose_target(ident)
+                mark_claim(h, ident)
+                with_gpu = True
+            except h.Refuse as exc:
+                h.log('Cold boot without optional GPU: ' + str(exc))
+    finally:
+        os.close(fd)
+    # createXML on an existing inactive persistent guest uses a separate live XML.
+    try:
+        virsh_input(h.boot_xml(xml, with_gpu), 'create', '/dev/stdin', '--validate')
+    finally:
+        if with_gpu:
+            fd = h.lock()
+            try:
+                finish_claim(h)
+            finally:
+                os.close(fd)
+
+
+
+
+def virsh(*args):
+    return run('/usr/bin/virsh', '-c', 'qemu:///system', *args)
+
+
+def pci_entries(xml):
+    root = ET.fromstring(xml)
+    entries = []
+    for dev in root.findall('./devices/hostdev[@type="pci"]'):
+        a = dev.find('./source/address')
+        if a is not None:
+            bdf = '%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function'))
+            entries.append((bdf, dev.get('managed')))
+    return root, entries
+
+
+def inventory():
+    if not shutil.which('virsh'):
+        return []
+    result = []
+    for ident in virsh('list', '--all', '--uuid').splitlines():
+        ident = ident.strip()
+        if not ident:
+            continue
+        if str(uuid.UUID(ident)) != ident:
+            raise Error('Unexpected libvirt domain UUID')
+        # Transient domains have no persistent XML.
+        info = dict(line.split(':', 1) for line in virsh('dominfo', ident).splitlines() if ':' in line)
+        persistent = info.get('Persistent', '').strip() == 'yes'
+        root, entries = pci_entries(virsh('dumpxml', '--inactive', ident) if persistent else virsh('dumpxml', ident))
+        state = virsh('domstate', ident)
+        _, live = pci_entries(virsh('dumpxml', ident)) if state != 'shut off' else (None, [])
+        h = load_hook() if SETTINGS else None
+        optional = h.optional_devices(root) if h is not None else []
+        if optional:
+            _, candidates = pci_entries('<domain><devices>' + ''.join(ET.tostring(d, encoding='unicode') for d in optional) + '</devices></domain>')
+        else:
+            candidates = entries
+        target = [entry for entry in candidates if entry[0] in BDFS]
+        result.append({'uuid': ident, 'name': root.findtext('name'), 'state': state,
+                       'optional': bool(optional), 'startup_gpu': any(bdf in BDFS for bdf, _ in entries), 'pci': bool(entries or optional), 'eligible': len(target) == len(BDFS) and
+                       {e[0] for e in target} == set(BDFS) and all(e[1] in (None, 'no', 'yes') for e in target),
+                       'live_gpu': [e[0] for e in live if e[0] in BDFS]})
+    return result
+
+
+def destination_rows(records):
+    rows = [('none', 'None', 'Idle GPU', 'Leave GPU idle, without a VM or Xorg', True),
+            ('cuda', 'CUDA without Xorg', 'Compute', 'NVIDIA + UVM for CUDA; desktop stays on the primary GPU', True),
+            ('xorg', 'Xorg', 'Host gaming', 'NVIDIA PRIME; desktop stays on the primary GPU', True)]
+    states = {'running': 'running', 'shut off': 'shut off', 'paused': 'paused', 'in shutdown': 'shutting down'}
+    for d in records:
+        if d['pci']:
+            info = states.get(d['state'], d['state'])
+            live_gpu = set(d['live_gpu'])
+            if live_gpu == set(BDFS):
+                info += ' · GPU attached'
+            elif live_gpu:
+                info += f' · GPU partial ({len(live_gpu)}/{len(BDFS)})'
+            else:
+                info += ' · no GPU'
+            if not d['eligible']:
+                info += '; not configured for the selected GPU'
+            rows.append((d['uuid'], d['name'], 'Virtual machine', info, d['eligible']))
+    return rows
+
+
+def operation_plan(target, records, xorg_attached):
+    selected = next((d for d in records if d['uuid'] == target), None)
+    if target not in ('none', 'xorg', 'cuda') and (selected is None or not selected['eligible']):
+        raise Error('The selected VM must have all PCI functions of the selected NVIDIA GPU configured.')
+    if selected and selected['state'] == 'shut off' and not selected.get('optional'):
+        raise Error('Enable optional GPU setup for this VM before a one-time GPU boot.')
+    owners = [d for d in records if d['live_gpu']]
+    if selected and selected['live_gpu'] and set(selected['live_gpu']) == set(BDFS):
+        return [], False
+    stops = [d for d in owners if not (selected and d['uuid'] == target and selected.get('optional'))]
+    if selected and selected['state'] != 'shut off' and selected not in stops and not (selected.get('optional') and selected['state'] == 'running'):
+        stops.append(selected)
+    if any(d['state'] != 'running' for d in stops):
+        raise Error('First shut down the paused or transitioning GPU-owning VM manually.')
+    return stops, (target == 'xorg' and not xorg_attached) or (target != 'xorg' and xorg_attached)
+
+
+def operation_status(h, job, state, message, target):
+    if OP_STATUS is None:
+        print(message, flush=True)
+        return
+    h.atomic_json(OP_STATUS, {'job': job, 'state': state, 'message': message,
+                             'target': target, 'gpu': GPU, 'time': time.time()}, mode=0o644)
+
+
+def selection_worker(target, job, shutdown, restart):
+    if os.geteuid() != 0:
+        raise Error('Administrator authentication required')
+    h = load_hook()
+    h.assert_x11()
+    if not hasattr(h, 'park'):
+        raise Error('Install the GUI handoff update first.')
+    operation_status(h, job, 'running', 'Checking current GPU attachment…', target)
+    # Every libvirt operation below occurs outside the shared GPU lock.
+    try:
+        records = inventory()
+        attached = bool(xorg_owners(h))
+        stops, needs_restart = operation_plan(target, records, attached)
+        selected = next((d for d in records if d['uuid'] == target), None)
+        if stops and not shutdown:
+            raise Error('Switching requires permission to shut down the current VM gracefully.')
+        if needs_restart and not restart:
+            raise Error('Switching requires permission to end graphical sessions.')
+        fd = h.lock()
+        try:
+            h.topology()
+            if selected and set(selected['live_gpu']) == set(BDFS):
+                if any(h.driver(b) != 'vfio-pci' for b in BDFS):
+                    raise Error('VM reports the GPU, but VFIO bindings do not match.')
+                h.choose_target(target)
+                operation_status(h, job, 'done', 'GPU is already attached to ' + selected['name'], target)
+                return
+            h.choose_target('blocked')  # No new guest may claim the GPU during a switch.
+        finally:
+            os.close(fd)
+        for domain in stops:
+            operation_status(h, job, 'running', 'Gracefully shutting down VM ' + domain['name'] + '…', target)
+            virsh('shutdown', domain['uuid'])
+            deadline = time.monotonic() + 120
+            while virsh('domstate', domain['uuid']) != 'shut off':
+                if time.monotonic() >= deadline:
+                    raise Error('VM did not shut down within 120 seconds. No forced shutdown was performed.')
+                time.sleep(1)
+        if any(d['live_gpu'] for d in inventory()):
+            raise Error('A VM owns the GPU again; switching has stopped.')
+        now_attached = bool(xorg_owners(h))
+        wanted_mode = 'on' if target == 'xorg' else 'off'
+        needs_restart_now = h.xorg_mode() != wanted_mode or now_attached != (target == 'xorg')
+        if needs_restart_now and not restart:
+            raise Error('Xorg state changed; confirm graphical logout before retrying.')
+        message = {'xorg': 'Attaching GPU to Xorg…', 'cuda': 'Attaching NVIDIA for CUDA without Xorg…'}.get(target, 'Releasing GPU for idle or VFIO use…')
+        operation_status(h, job, 'running', message, target)
+        worker('connect' if target == 'xorg' else 'disconnect', preserve_policy=True)
+        if target == 'cuda':
+            fd = h.lock()
+            try:
+                restore_host(h)
+                h.run('/usr/sbin/modprobe', 'nvidia_uvm')
+                if not h.module_loaded('nvidia_uvm'):
+                    raise Error('The NVIDIA UVM module for CUDA did not load.')
+                if h.xorg_mode() != 'off' or xorg_owners(h):
+                    raise Error('Xorg still uses NVIDIA; CUDA mode was not applied.')
+                h.choose_target('cuda')
+            finally:
+                os.close(fd)
+            operation_status(h, job, 'done', 'CUDA ready: NVIDIA is host-bound; Xorg uses only the primary GPU.', target)
+            return
+        if target == 'xorg':
+            fd = h.lock()
+            try:
+                h.choose_target('xorg')
+            finally:
+                os.close(fd)
+            operation_status(h, job, 'done', 'GPU attached to Xorg. Sign in again to launch games.', target)
+            return
+        current = next((d for d in inventory() if d['uuid'] == target), None)
+        if current and current.get('optional') and current['state'] == 'running':
+            attach_running(target)
+            operation_status(h, job, 'done', 'GPU attached to running VM ' + current['name'], target)
+            return
+        fd = h.lock()
+        try:
+            state = h.load()
+            if state is not None and state['phase'] != 'parked':
+                # A failed post-stop return may be retried only after ownership checks.
+                h.release()
+            h.park()
+            h.choose_target(target)
+        finally:
+            os.close(fd)
+        if target != 'none':
+            current = next((d for d in inventory() if d['uuid'] == target), None)
+            if current is None or not current['eligible'] or current['state'] not in ('shut off', 'running'):
+                raise Error('The selected VM configuration or state changed.')
+            operation_status(h, job, 'running', 'Starting VM ' + current['name'] + '…', target)
+            if current.get('optional') and current['state'] == 'running':
+                attach_running(target)
+            else:
+                start_optional(target)
+            message = 'GPU attached to VM ' + current['name']
+        else:
+            message = 'GPU is idle, without a VM or Xorg attachment.'
+        operation_status(h, job, 'done', message, target)
+    except BaseException as exc:
+        operation_status(h, job, 'error', str(exc), target)
+        raise
+
+
+def select_destination(target, job, shutdown, restart):
+    if target not in ('none', 'xorg', 'cuda') and str(uuid.UUID(target)) != target:
+        raise Error('Invalid target UUID')
+    if str(uuid.UUID(job)) != job:
+        raise Error('Invalid operation ID')
+    if os.geteuid() != 0:
+        raise Error('Use the GUI authorization dialog or run select as administrator.')
+    h = load_hook()
+    h.assert_x11()
+    if not hasattr(h, 'park'):
+        raise Error('Install the GUI handoff update first.')
+    ensure_integration(vm=target not in ('none', 'xorg', 'cuda'))
+    args = ['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--selection-worker', target, '--job-id', job]
+    caller = os.environ.get('PKEXEC_UID')
+    if caller:
+        status_file(int(caller), job)
+        args += ['--status-uid', caller]
+    if shutdown:
+        args.append('--shutdown-owner')
+    if restart:
+        args.append('--restart-session')
+    run('/usr/bin/systemd-run', '--unit=nvidia-handoff', '--collect', '--property=Type=exec', *args)
+
+
+
+def desktop_appearance(root):
+    """Respect XFCE/Xft settings, with Tk defaults when desktop tools are absent."""
+    dpi = float(root.winfo_fpixels('1i'))
+    family, size = 'Sans', 11
+    def query(*args):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=1.5)
+            return result.stdout.strip() if result.returncode == 0 else ''
+        except (OSError, subprocess.TimeoutExpired):
+            return ''
+    resource = query('/usr/bin/xrdb', '-query')
+    match = re.search(r'(?m)^Xft\.dpi:\s*(\d+(?:\.\d+)?)\s*$', resource)
+    if match and 48 <= float(match.group(1)) <= 384:
+        dpi = float(match.group(1))
+    preference = query('/usr/bin/xfconf-query', '-c', 'xsettings', '-p', '/Gtk/FontName')
+    match = re.fullmatch(r'(.+?)\s+(\d+(?:\.\d+)?)', preference)
+    if match and 6 <= float(match.group(2)) <= 32:
+        family, size = match.group(1), round(float(match.group(2)))
+    return max(48, min(384, dpi)), family, size
+
+
+def configure_gui_style(root):
+    from tkinter import ttk
+    import tkinter.font as fonts
+    dpi, family, size = desktop_appearance(root)
+    root.tk.call('tk', 'scaling', dpi / 72)
+    for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont', 'TkCaptionFont'):
+        fonts.nametofont(name, root=root).configure(family=family, size=size)
+    body = fonts.nametofont('TkDefaultFont', root=root)
+    heading = fonts.nametofont('TkHeadingFont', root=root)
+    heading.configure(weight='bold')
+    title = body.copy()
+    title.configure(size=size + 4, weight='bold')
+    scale = dpi / 96
+    px = lambda value: max(1, round(value * scale))
+    style = ttk.Style(root)
+    style.configure('Handoff.Treeview', font=body, rowheight=body.metrics('linespace') + px(12))
+    style.configure('Handoff.Treeview.Heading', font=heading, padding=(px(10), px(7)))
+    style.configure('Handoff.TButton', font=body, padding=(px(12), px(7)))
+    style.configure('Handoff.Vertical.TScrollbar', arrowsize=px(14), width=px(16))
+    style.configure('Handoff.Horizontal.TScrollbar', arrowsize=px(14), width=px(16))
+    columns = (max(px(190), body.measure('CUDA without Xorg') + px(32)),
+               max(px(190), body.measure('Virtual machine') + px(32)),
+               max(px(310), heading.measure('Status / attachment') + px(32),
+                   body.measure('PRIME, primary desktop GPU') + px(32)))
+    return px, body, title, columns
+
+
+def row_summary(row, current=None):
+    summaries = {'none': 'VFIO, unattached', 'cuda': 'NVIDIA + UVM, no Xorg',
+                 'xorg': 'PRIME, primary desktop GPU'}
+    if row[0] == current and current in summaries:
+        return {'none': 'Current · idle GPU', 'cuda': 'GPU attached · CUDA',
+                'xorg': 'GPU attached · Xorg'}[current]
+    if row[0] in summaries:
+        return summaries[row[0]]
+    if not row[4]:
+        return row[3].split(';', 1)[0] + ' · GPU setup required'
+    return row[3]
+
+
+class GPUWindow:
+    def __init__(self, root):
+        import tkinter as tk
+        from tkinter import ttk
+        self.root = root
+        self.records = []
+        self.rows = {}
+        self.current_target = None
+        self.refreshing = False
+        self.last_refresh = 0
+        self.busy = False
+        self.process = None
+        self.job = None
+        self.cleaning = False
+        self.starting = None
+        self.shown_error = None
+        self.messages = queue.Queue()
+        root.title('NVIDIA handoff — ' + LABEL)
+        px, body, self.title_font, columns = configure_gui_style(root)
+        self.px = px
+        frame = ttk.Frame(root, padding=px(22))
+        frame.pack(fill='both', expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+        title = ttk.Label(frame, text='Where should we attach ' + LABEL + '?', font=self.title_font)
+        title.grid(row=0, column=0, sticky='w')
+        self.current = tk.StringVar(value='Checking current GPU attachment…')
+        current_label = ttk.Label(frame, textvariable=self.current)
+        current_label.grid(row=1, column=0, sticky='w', pady=(px(8), px(18)))
+        table = ttk.Frame(frame)
+        table.grid(row=2, column=0, sticky='nsew')
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(table, columns=('kind', 'state'), selectmode='browse', height=6,
+                                 style='Handoff.Treeview')
+        for column, heading, width in zip(('#0', 'kind', 'state'),
+                ('Destination', 'Type', 'Status / attachment'), columns):
+            self.tree.heading(column, text=heading, anchor='w')
+            self.tree.column(column, width=width, minwidth=width, stretch=column == 'state', anchor='w')
+        self.tree.tag_configure('unavailable', foreground='#777777')
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vertical = ttk.Scrollbar(table, orient='vertical', command=self.tree.yview, style='Handoff.Vertical.TScrollbar')
+        vertical.grid(row=0, column=1, sticky='ns')
+        horizontal = ttk.Scrollbar(table, orient='horizontal', command=self.tree.xview, style='Handoff.Horizontal.TScrollbar')
+        horizontal.grid(row=1, column=0, sticky='ew')
+        self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.tree.bind('<<TreeviewSelect>>', lambda event: self.update_button())
+        self.detail = tk.StringVar(value='Choose a destination. VM targets require all PCI functions of the selected GPU.')
+        detail_label = ttk.Label(frame, textvariable=self.detail)
+        detail_label.grid(row=3, column=0, sticky='w', pady=(px(14), px(8)))
+        self.progress = tk.StringVar(value='')
+        progress_label = ttk.Label(frame, textvariable=self.progress)
+        progress_label.grid(row=4, column=0, sticky='w', pady=(0, px(10)))
+        self.wrap_labels = (title, current_label, detail_label, progress_label)
+        frame.bind('<Configure>', lambda event: self.resize_text(event.width))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, sticky='ew')
+        ttk.Button(buttons, text='Refresh', command=self.refresh, style='Handoff.TButton').pack(side='left')
+        self.cleanup_button = ttk.Button(buttons, text='Full cleanup…', command=self.cleanup, style='Handoff.TButton')
+        self.cleanup_button.pack(side='left', padx=px(10))
+        ttk.Button(buttons, text='Close', command=root.destroy, style='Handoff.TButton').pack(side='right')
+        self.apply_button = ttk.Button(buttons, text='Connect', command=self.apply,
+                                      state='disabled', style='Handoff.TButton')
+        self.apply_button.pack(side='right', padx=px(10))
+        self.start_button = ttk.Button(buttons, text='Start without GPU', command=self.start_vm,
+                                       state='disabled', style='Handoff.TButton')
+        self.start_button.pack(side='right')
+        root.update_idletasks()
+        width = min(max(sum(columns) + px(68), buttons.winfo_reqwidth() + px(44)), round(root.winfo_screenwidth() * .9))
+        self.resize_text(width)
+        root.update_idletasks()
+        height = min(max(px(540), root.winfo_reqheight()), round(root.winfo_screenheight() * .9))
+        root.geometry(f'{width}x{height}')
+        root.minsize(min(max(px(650), buttons.winfo_reqwidth() + px(44)), width), min(root.winfo_reqheight(), height))
+        self.root.after(50, self.refresh)
+        self.root.after(150, self.poll)
+
+    def resize_text(self, width):
+        available = max(self.px(180), width - self.px(44))
+        for label in self.wrap_labels:
+            label.configure(wraplength=available)
+
+    def update_button(self):
+        self.cleanup_button.configure(state='disabled' if self.busy else 'normal')
+        selected = self.tree.selection()
+        row = self.rows.get(selected[0]) if selected else None
+        record = self.selected_vm()
+        self.start_button.configure(state='normal' if not self.busy and record and
+            record['state'] == 'shut off' and not record.get('startup_gpu', False) else 'disabled')
+        self.apply_button.configure(state='normal' if row and row[4] and not self.busy and
+            row[0] != self.current_target else 'disabled')
+        if row:
+            self.detail.set(row[3] + (' · all GPU PCI functions configured' if row[2] == 'Virtual machine' and row[4] else ''))
+
+    def refresh(self):
+        if self.refreshing:
+            return
+        self.refreshing = True
+        self.last_refresh = time.monotonic()
+        def fetch():
+            try:
+                records = inventory()
+                attached = pci_driver(GPU) == 'nvidia' and not load_hook().shared_nvidia_driver() and bool(nvidia_provider(providers()))
+                self.messages.put(('inventory', records, attached, pci_driver(GPU)))
+            except Exception as exc:
+                self.messages.put(('error', str(exc)))
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def show_inventory(self, records, attached, driver):
+        self.refreshing = False
+        self.records = records
+        self.attached = attached
+        owners = [d for d in records if d['live_gpu']]
+        if owners:
+            self.current.set('Current attachment: VM ' + ', '.join(d['name'] for d in owners))
+            current = owners[0]['uuid']
+        elif attached:
+            self.current.set('Current attachment: Xorg — NVIDIA gaming, desktop on the primary GPU')
+            current = 'xorg'
+        elif driver == 'nvidia':
+            self.current.set('Current attachment: CUDA without Xorg — desktop on the primary GPU')
+            current = 'cuda'
+        else:
+            self.current.set('Current attachment: ' + ('none — idle GPU on VFIO' if driver == 'vfio-pci' else 'host; not attached to Xorg'))
+            current = 'none'
+        self.current_target = current
+        if owners and set(owners[0]['live_gpu']) != set(BDFS):
+            self.current_target = None
+        elif current == 'none' and driver not in ('vfio-pci', 'unbound'):
+            self.current_target = None
+        previous = self.tree.selection()
+        chosen = previous[0] if previous else current
+        self.tree.delete(*self.tree.get_children())
+        self.rows = {row[0]: row for row in destination_rows(records)}
+        for row in self.rows.values():
+            self.tree.insert('', 'end', iid=row[0], text=row[1], values=(row[2], row_summary(row, current)), tags=() if row[4] else ('unavailable',))
+        if chosen in self.rows:
+            self.tree.selection_set(chosen)
+        self.update_button()
+
+    def selected_vm(self):
+        selected = self.tree.selection()
+        return next((d for d in self.records if selected and d['uuid'] == selected[0]), None)
+
+    def start_vm(self):
+        record = self.selected_vm()
+        if self.busy or not record or record['state'] != 'shut off' or record.get('startup_gpu', False):
+            return
+        self.process = subprocess.Popen(['/usr/bin/python3', '-I', str(Path(__file__).resolve()),
+            'start-vm', record['uuid'], '--without-gpu'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.starting = record['name']
+        self.job = None
+        self.busy = True
+        self.progress.set('Starting ' + self.starting + ' without GPU…')
+        self.update_button()
+
+    def apply(self):
+        from tkinter import messagebox
+        selected = self.tree.selection()
+        if not selected or self.busy:
+            return
+        target = selected[0]
+        if target == self.current_target:
+            return
+        try:
+            stops, restart = operation_plan(target, self.records, getattr(self, 'attached', False))
+        except Exception as exc:
+            messagebox.showerror('Cannot switch GPU', str(exc), parent=self.root)
+            return
+        label = self.rows[target][1]
+        changes = ['Attach GPU to: ' + label + '.']
+        if stops:
+            changes.append('VMs to shut down gracefully: ' + ', '.join(d['name'] for d in stops) + '.')
+        if restart:
+            changes.append('Graphical sessions will end. Save your work before continuing.')
+        if target not in ('none', 'xorg', 'cuda') and stops:
+            changes.append('The selected VM will start after the GPU is released.')
+        if not messagebox.askokcancel('Switch GPU', '\n\n'.join(changes), parent=self.root):
+            return
+        self.job = str(uuid.uuid4())
+        args = ['/usr/bin/pkexec', '--disable-internal-agent', '/usr/bin/python3', '-I', str(Path(__file__).resolve()),
+                'select', target, '--job-id', self.job]
+        if stops:
+            args.append('--shutdown-owner')
+        if restart:
+            args.append('--restart-session')
+        self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.busy = True
+        self.progress.set('Waiting for administrator authentication…')
+        self.update_button()
+
+    def cleanup(self):
+        from tkinter import messagebox
+        if self.busy or not messagebox.askokcancel(
+                'Full cleanup', 'Remove NVIDIA handoff and its integration files?\n\n'
+                'VMs will keep their GPU-free startup settings. Running VMs will not be stopped. '
+                'Cleanup refuses while the GPU is in use. Host sound may need a new login.\n\n'
+                'This also removes the program itself.', parent=self.root):
+            return
+        self.cleaning = self.busy = True
+        self.job = None
+        self.process = subprocess.Popen(['/usr/bin/pkexec', '--disable-internal-agent',
+            '/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--cleanup', '--yes'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.progress.set('Waiting for administrator authentication…')
+        self.update_button()
+
+    def poll(self):
+        from tkinter import messagebox
+        while True:
+            try:
+                message = self.messages.get_nowait()
+            except queue.Empty:
+                break
+            if message[0] == 'inventory':
+                self.show_inventory(*message[1:])
+            else:
+                self.refreshing = False
+                self.progress.set('Could not refresh the list: ' + message[1])
+        if self.process is not None and self.process.poll() is not None:
+            _, error = self.process.communicate()
+            code = self.process.returncode
+            self.process = None
+            if self.starting is not None:
+                name, self.starting = self.starting, None
+                self.busy = False
+                self.progress.set(('Could not start ' + name + ': ' + error.strip()) if code else name + ' started without GPU.')
+                self.update_button()
+                self.refresh()
+                if code:
+                    messagebox.showerror('VM start failed', error.strip(), parent=self.root)
+            elif self.cleaning:
+                self.cleaning = self.busy = False
+                if not code:
+                    messagebox.showinfo('Full cleanup', 'NVIDIA handoff has been removed. Log in again to restore HDMI audio monitoring.', parent=self.root)
+                    self.root.destroy()
+                    return
+                messagebox.showerror('Cleanup stopped', error.strip(), parent=self.root)
+                self.progress.set('Cleanup stopped: ' + error.strip())
+                self.update_button()
+            elif code:
+                self.busy = False
+                self.progress.set('Switching did not start: ' + error.strip())
+                self.update_button()
+            else:
+                self.progress.set('GPU switching started…')
+        progress_file = status_file(os.getuid(), self.job) if self.busy and self.job else None
+        if progress_file and progress_file.exists():
+            try:
+                data = json.loads(progress_file.read_text())
+                if data.get('job') == self.job:
+                    self.progress.set(data['message'])
+                    if data['state'] in ('done', 'error'):
+                        progress_file.unlink(missing_ok=True)
+                        self.busy = False
+                        self.update_button()
+                        self.refresh()
+                        if data['state'] == 'error' and self.shown_error != self.job:
+                            self.shown_error = self.job
+                            messagebox.showerror('GPU switching stopped', data['message'], parent=self.root)
+            except (OSError, ValueError, KeyError):
+                pass
+        if not self.busy and not self.refreshing and time.monotonic() - self.last_refresh >= 4:
+            self.refresh()
+        self.root.after(300, self.poll)
+
+
+def gui():
+    import tkinter as tk
+    if os.geteuid() == 0:
+        raise Error('Open the window as your normal user, without sudo.')
+    load_hook().assert_x11(need_display=True)
+    root = tk.Tk()
+    GPUWindow(root)
+    root.mainloop()
+
+
+def make_config_directory(path):
+    """New system configuration directories must remain readable under umask 077."""
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for current in reversed(missing):
+        current.mkdir(mode=0o755)
+        current.chmod(0o755)
+
+
+def audio_monitor_policy(config):
+    """Keep the displayless GPU's HDMI audio available for safe PCI handoff.
+
+    WirePlumber otherwise keeps ALSA control FDs open even with no HDMI sink.
+    Do not disable busy checks or stop audio services from a libvirt hook.
+    """
+    devices = [d for d in config['devices'] if d['class'] == '0x040300']
+    if not devices or not shutil.which('wireplumber'):
+        return []
+    version = run('/usr/bin/wireplumber', '--version')
+    match = re.search(r'(?:libwireplumber|WirePlumber)\s+(\d+)\.(\d+)\.(\d+)', version, re.I)
+    if not match:
+        raise Error('Cannot determine WirePlumber version for NVIDIA HDMI audio policy')
+    numbers = tuple(map(int, match.groups()))
+    if numbers < (0, 4, 7):
+        raise Error('WirePlumber 0.4.7 or newer is needed to exclude the selected HDMI audio device safely')
+    names = ['alsa_card.pci-' + d['bdf'].replace(':', '_') for d in devices]
+    suffix = config['gpu'].replace(':', '_').replace('.', '_')
+    if numbers >= (0, 5, 0):
+        rules = [{'matches': [{'device.name': name}],
+                  'actions': {'update-props': {'device.disabled': True}}} for name in names]
+        path = Path('/etc/wireplumber/wireplumber.conf.d') / ('51-nvidia-handoff-' + suffix + '.conf')
+        data = '# Managed by nvidia-handoff: selected displayless GPU HDMI audio only.\n'
+        data += 'monitor.alsa.rules = ' + json.dumps(rules, indent=2) + '\n'
+    else:
+        path = Path('/etc/wireplumber/main.lua.d') / ('51-nvidia-handoff-' + suffix + '.lua')
+        data = '-- Managed by nvidia-handoff: selected displayless GPU HDMI audio only.\n'
+        for name in names:
+            data += ('table.insert(alsa_monitor.rules, {\n'
+                     '  matches = { { { "device.name", "equals", ' + json.dumps(name) + ' } } },\n'
+                     '  apply_properties = { ["device.disabled"] = true },\n'
+                     '})\n')
+    return [(path, data.encode())]
+
+
+HOOK = b'#!/bin/sh\ncase "$2:$3" in\n    prepare:begin|release:end) exec /usr/bin/python3 -I /opt/nvidia-handoff --libvirt-hook "$@" ;;\n    *) exit 0 ;;\nesac\n'
+XORG_OFF = b'Section "ServerFlags"\n    Option "AutoAddGPU" "off"\nEndSection\n'
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def check_managed(path, data, config):
+    if not path.exists() and not path.is_symlink():
+        return
+    validate_root_file(path)
+    current = path.read_bytes()
+    recorded = config.get('managed_files', {}).get(str(path))
+    if current != data and (not recorded or digest(current) != recorded):
+        raise Error('Preserving administrator-modified file: ' + str(path))
+
+
+def write_file(path, data, mode=0o644):
+    import tempfile
+    make_config_directory(path.parent)
+    if path.exists() or path.is_symlink():
+        validate_root_file(path)
+    st = path.parent.lstat()
+    if st.st_uid != 0 or st.st_mode & 0o022 or not stat.S_ISDIR(st.st_mode):
+        raise Error('Unsafe directory: ' + str(path.parent))
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.nvidia-handoff-', delete=False) as f:
+        tmp = Path(f.name)
+        try:
+            os.fchmod(f.fileno(), mode)
+            f.write(data); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def ensure_integration(vm=False):
+    """Called only by an explicit switching/setup action, never by GUI/status."""
+    h = load_hook()
+    desired = []
+    if not CONFIG.exists():
+        desired.append((CONFIG, XORG_OFF, 0o644))
+    if vm:
+        desired.extend((p, data, 0o644) for p, data in audio_monitor_policy(SETTINGS))
+        desired.append((Path(SETTINGS['hook_path']), HOOK, 0o755))
+    for path, data, _ in desired:
+        check_managed(path, data, SETTINGS)
+    needed = [(p, data, mode) for p, data, mode in desired
+              if not p.exists() or p.read_bytes() != data or str(p) not in SETTINGS.get('managed_files', {})]
+    if not needed:
+        return
+    fd = h.lock()
+    try:
+        current = json.loads(SETTINGS_PATH.read_text())
+        if current.get('installation_id') != SETTINGS.get('installation_id'):
+            raise Error('Installation changed during setup')
+        SETTINGS.update(current)
+        for path, data, mode in needed:
+            check_managed(path, data, SETTINGS)
+            write_file(path, data, mode)
+            SETTINGS.setdefault('managed_files', {})[str(path)] = digest(data)
+        write_file(SETTINGS_PATH, (json.dumps(SETTINGS, indent=2) + '\n').encode())
+    finally:
+        os.close(fd)
+    # Hook discovery refresh happens outside the lock; no daemon restart.
+    if any(str(p) == SETTINGS['hook_path'] for p, _, _ in needed):
+        for daemon in ('virtqemud.service', 'libvirtd.service'):
+            if run('/usr/bin/systemctl', 'show', daemon, '-p', 'ActiveState', '--value') == 'active':
+                run('/usr/bin/systemctl', 'kill', '--kill-whom=main', '--signal=HUP', daemon)
+
+
+def status_file(uid, job):
+    if uid <= 0 or str(uuid.UUID(job)) != job:
+        raise Error('Invalid progress owner or job ID')
+    runtime = Path('/run/user') / str(uid)
+    st = runtime.lstat()
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+        raise Error('Unsafe user runtime directory')
+    return runtime / ('nvidia-handoff-' + job + '.json')
+
+
+def leftover_progress():
+    files = []
+    for runtime in Path('/run/user').iterdir():
+        if not runtime.name.isdigit() or runtime.name == '0':
+            continue
+        st = runtime.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != int(runtime.name) or st.st_mode & 0o022:
+            continue
+        for path in runtime.glob('nvidia-handoff-*.json'):
+            try:
+                job = path.name[len('nvidia-handoff-'):-len('.json')]
+                if str(uuid.UUID(job)) != job:
+                    continue
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd) as source:
+                    st = os.fstat(source.fileno())
+                    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_size > 65536:
+                        continue
+                    data = json.load(source)
+                if isinstance(data, dict) and data.get('gpu') == GPU and data.get('job') == job:
+                    files.append(path)
+            except (OSError, ValueError, TypeError):
+                continue
+    return files
+
+
+def redundant_files():
+    """Only known artifacts from earlier versions; never recurse into unknown files."""
+    files, directories = [], []
+    groups = {
+        Path('/opt/nvidia-handoff-portable'): {'nvidia-handoff', 'nvidia_handoff_core.py', 'README.md', 'test_portable.py'},
+        Path('/opt/nvidia-handoff-backup'): {'50-omm-gpu-handoff', 'nvidia-handoff', 'nvidia-handoff.before-optional',
+            'nvidia-handoff.json', 'nvidia_handoff_core.py', 'nvidia_handoff_core.py.before-optional'},
+        Path('/var/lib/nvidia-handoff/optional-backups'): None,
+    }
+    for directory, names in groups.items():
+        if not directory.exists() and not directory.is_symlink():
+            continue
+        st = directory.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise Error('Unsafe artifact directory: ' + str(directory))
+        for path in directory.iterdir():
+            known = path.name in names if names is not None else bool(re.fullmatch(
+                r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.xml', path.name))
+            if not known:
+                raise Error('Unexpected file; preserving artifact directory: ' + str(path))
+            validate_root_file(path)
+            files.append(path)
+        directories.append(directory)
+    for path in (Path('/opt/nvidia-handoff-portable.tar.gz'), Path('/run/gpu-xorg-status.json'),
+                 Path('/run/nvidia-handoff-host.json')):
+        if path.exists() or path.is_symlink():
+            validate_root_file(path)
+            files.append(path)
+    for link in (Path('/opt/gpu-xorg'), Path('/usr/local/bin/nvidia-handoff')):
+        if link.is_symlink() and os.readlink(link) == '/opt/nvidia-handoff':
+            if link.lstat().st_uid != 0:
+                raise Error('Unexpected symlink owner: ' + str(link))
+            files.append(link)
+        elif link.exists() or link.is_symlink():
+            raise Error('Preserving unexpected file: ' + str(link))
+    return files, directories
+
+
+def remove_files(files, directories):
+    for path in files:
+        path.unlink(missing_ok=True)
+    for directory in directories:
+        if directory.exists() and not any(directory.iterdir()):
+            directory.rmdir()
+
+
+def cleanup_blockers(h):
+    require_stopped()  # All libvirt calls are outside the GPU lock.
+    if run('/usr/bin/systemctl', 'show', UNIT, '-p', 'ActiveState', '--value') in ('active', 'activating', 'deactivating'):
+        raise Error('A GPU switching job is active; wait for it to finish.')
+    if (h.STATE_DIR / 'xorg-transition').exists() or (h.STATE_DIR / 'uninstalling').exists():
+        raise Error('An unfinished GPU transition exists; finish/recover it first.')
+    cleanup_devices(h)
+    state = h.load()
+    if state is not None:
+        h.assert_claim(state)
+
+
+def cleanup_devices(h):
+    h.topology()
+    h.display_idle()
+    if xorg_owners(h):
+        raise Error('GPU is attached to Xorg. Disconnect it before full cleanup.')
+    pid = run('/usr/bin/systemctl', 'show', h.SERVICE, '-p', 'MainPID', '--value')
+    h.idle(h.host_nodes() | h.vfio_nodes(), ignored_pids=(int(pid),) if pid.isdigit() and int(pid) else ())
+
+
+def cleanup(args):
+    if os.geteuid() != 0:
+        raise Error('Run full cleanup as administrator (use --dry-run to preview).')
+    h = load_hook()
+    files, directories = redundant_files()
+    files.extend(leftover_progress())
+    integrations = dict(SETTINGS.get('managed_files', {}))
+    allowed = {str(CONFIG), SETTINGS['hook_path']}
+    suffix = GPU.replace(':', '_').replace('.', '_')
+    allowed.update('/etc/wireplumber/' + folder + '/51-nvidia-handoff-' + suffix + ext
+                   for folder, ext in (('wireplumber.conf.d', '.conf'), ('main.lua.d', '.lua')))
+    for name, expected in integrations.items():
+        if name not in allowed:
+            raise Error('Unrecognized managed path in configuration: ' + name)
+        path = Path(name)
+        if path.exists() or path.is_symlink():
+            validate_root_file(path)
+            if digest(path.read_bytes()) != expected:
+                raise Error('Preserving administrator-modified file: ' + name)
+            files.append(path)
+    for path in (SETTINGS_PATH, Path('/opt/nvidia-handoff'), Path('/opt/nvidia_handoff_core.py')):
+        validate_root_file(path)
+        files.append(path)
+    if h.STATE_DIR.exists():
+        st = h.STATE_DIR.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o700:
+            raise Error('Unsafe runtime directory')
+        for path in h.STATE_DIR.iterdir():
+            if path.name not in ('lock', 'state.json', 'destination.json', 'xorg-transition', 'uninstalling'):
+                raise Error('Unexpected runtime file: ' + str(path))
+            validate_root_file(path)
+    original_mode = SETTINGS.get('xorg_original_mode')
+    if str(CONFIG) not in integrations and CONFIG.exists():
+        validate_root_file(CONFIG)
+        if h.xorg_mode() != SETTINGS.get('xorg_applied_mode', original_mode):
+            raise Error('AutoAddGPU was changed outside NVIDIA handoff; preserving it.')
+        if original_mode not in ('on', 'off'):
+            raise Error('Original Xorg setting is unknown; preserving it. Reinstall this version first.')
+    guests = []
+    if shutil.which('virsh'):
+        for ident in virsh('list', '--all', '--uuid').split():
+            if str(uuid.UUID(ident)) != ident:
+                raise Error('Invalid domain UUID')
+            if not re.search(r'^Persistent:\s+yes$', virsh('dominfo', ident), re.M):
+                continue
+            xml = virsh('dumpxml', '--inactive', ident)
+            changed = h.disable_optional_xml(xml)
+            if changed is not None:
+                guests.append((ident, xml, changed))
+    print('Remove:\n' + '\n'.join(str(p) for p in files), flush=True)
+    print('Remove handoff metadata from VM definitions (keep GPU-free startup): ' + (', '.join(ET.fromstring(x).findtext('name') for _, x, _ in guests) or 'none'), flush=True)
+    print('Restore host GPU bindings and original AutoAddGPU setting; remove runtime state. VM power states remain unchanged.', flush=True)
+    print('Private home directories are not inspected. System journal history is retained.', flush=True)
+    if args.dry_run:
+        try:
+            cleanup_blockers(h)
+        except Exception as exc:
+            print('Currently blocked: ' + str(exc), flush=True)
+        return
+    cleanup_blockers(h)  # Refuse before creating even a lock or marker.
+    if not args.yes and (not sys.stdin.isatty() or input('Remove NVIDIA handoff completely? Type REMOVE: ') != 'REMOVE'):
+        raise Error('Cleanup cancelled; use --yes for an explicitly confirmed noninteractive removal.')
+    fd = h.lock()
+    marker = h.STATE_DIR / 'uninstalling'
+    restored = []
+    try:
+        # Recheck users without querying libvirt while locked.
+        cleanup_devices(h)
+        h.atomic_json(marker, {'pid': os.getpid()})
+        restore_host(h)
+        os.close(fd)
+        fd = None
+        # No libvirt calls under our lock: hooks can acquire it and reject GPU starts via marker.
+        for ident, old, changed in guests:
+            current = virsh('dumpxml', '--inactive', ident)
+            if ET.tostring(ET.fromstring(current)) != ET.tostring(ET.fromstring(old)):
+                raise Error('VM configuration changed during cleanup; retry: ' + ident)
+            virsh_input(changed, 'define', '/dev/stdin', '--validate')
+            restored.append((ident, old, changed))
+        fd = h.lock(cleaning=True)
+        for name, expected in integrations.items():
+            if Path(name).exists() and digest(Path(name).read_bytes()) != expected:
+                raise Error('Integration changed during cleanup: ' + name)
+        if str(CONFIG) not in integrations and CONFIG.exists() and h.xorg_mode() != original_mode:
+            data = re.sub(rb'(?im)^(\s*Option\s+"AutoAddGPU"\s+")(?:on|off)("\s*)$',
+                          lambda m: m[1] + original_mode.encode() + m[2], CONFIG.read_bytes())
+            atomic_config(data)
+        # Delete the installation identity before removing its lock: queued old workers refuse to recreate state.
+        files.remove(SETTINGS_PATH)
+        SETTINGS_PATH.unlink()
+        remove_files(files, directories)
+        for parent in {Path(name).parent for name in integrations if name.startswith('/etc/wireplumber/')} :
+            if parent.exists() and not parent.is_symlink() and not any(parent.iterdir()):
+                parent.rmdir()
+        for path in h.STATE_DIR.iterdir():
+            path.unlink()
+        h.STATE_DIR.rmdir()
+        parent = Path('/var/lib/nvidia-handoff')
+        if parent.exists() and not parent.is_symlink() and not any(parent.iterdir()):
+            parent.rmdir()
+        print('Full cleanup complete. Log in again to restore HDMI audio monitoring.', flush=True)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+        # Restore VM metadata on a pre-removal failure, outside the GPU lock.
+        if SETTINGS_PATH.exists():
+            for ident, old, changed in reversed(restored):
+                current = virsh('dumpxml', '--inactive', ident)
+                if ET.tostring(ET.fromstring(current)) == ET.tostring(ET.fromstring(changed)):
+                    virsh_input(old, 'define', '/dev/stdin', '--validate')
+            marker.unlink(missing_ok=True)
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def install(argv):
+    """Install without changing any driver, guest, desktop or runtime transaction."""
+    import ast
+    parser = argparse.ArgumentParser(description='Install portable secondary NVIDIA handoff')
+    parser.add_argument('--gpu', help='PCI BDF when multiple eligible NVIDIA GPUs exist')
+    parser.add_argument('--display-manager', help='Optional systemd display manager unit')
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--optional-gpu', action='store_true', help='Enable optional GPU cold boot and hotplug')
+    args = parser.parse_args(argv)
+    if os.geteuid() != 0 and not args.dry_run:
+        raise Error('Install with sudo /usr/bin/python3 -I ./nvidia-handoff --install')
+    h = load_core(trusted=False)
+    h.assert_x11()
+    if not Path('/run/systemd/system').is_dir():
+        raise Error('This installer requires Debian with systemd/logind.')
+    for command in ('modprobe', 'modinfo', 'systemctl', 'systemd-run', 'loginctl', 'udevadm'):
+        if not shutil.which(command, path='/usr/sbin:/usr/bin:/sbin:/bin'):
+            raise Error('Missing required system command: ' + command)
+    config = h.discover(args.gpu)
+    # Detect previous installation by its own source markers, not by machine-specific paths.
+    legacy = []
+    hookdir = Path('/etc/libvirt/hooks/qemu.d')
+    for hook in hookdir.glob('*'):
+        if not hook.is_file() or hook.is_symlink():
+            continue
+        try:
+            text = hook.read_text()
+            if 'def framebuffer_idle(' not in text or 'def choose_target(' not in text:
+                continue
+            values = {}
+            for node in ast.parse(text).body:
+                if isinstance(node, ast.Assign):
+                    value = node.value
+                    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == 'Path' and len(value.args) == 1:
+                        value = value.args[0]
+                    try:
+                        literal = ast.literal_eval(value)
+                        for target in node.targets:
+                            if isinstance(target, ast.Name):
+                                values[target.id] = literal
+                            elif isinstance(target, ast.Tuple) and isinstance(literal, (list, tuple)) and len(target.elts) == len(literal):
+                                for name, part in zip(target.elts, literal):
+                                    if isinstance(name, ast.Name):
+                                        values[name.id] = part
+                    except (ValueError, TypeError):
+                        pass
+            if values.get('GPU') == config['gpu']:
+                legacy.append((hook, values))
+        except (SyntaxError, UnicodeError):
+            continue
+    if SETTINGS_PATH.exists():
+        validate_root_file(SETTINGS_PATH)
+        previous = json.loads(SETTINGS_PATH.read_text())
+        if previous['gpu'] != config['gpu']:
+            raise Error('Another GPU is already configured. Remove/migrate that installation explicitly first.')
+        for key in ('state_dir', 'xorg_config', 'hook_path', 'display_manager', 'installation_id', 'managed_files', 'xorg_original_mode', 'xorg_applied_mode'):
+            if key in previous:
+                config[key] = previous[key]
+    elif legacy:
+        if len(legacy) != 1:
+            raise Error('Multiple legacy hooks match GPU; resolve duplicate hooks first.')
+        hook, values = legacy[0]
+        config.update(state_dir=values['STATE_DIR'], xorg_config=values['XORG_CONFIG'], hook_path=str(hook))
+    if args.display_manager:
+        if not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', args.display_manager):
+            raise Error('Invalid display manager unit')
+        config['display_manager'] = args.display_manager
+    h.configure(config)
+    h.topology()
+    h.load()  # Validate retained runtime state, do not recover/rebind it.
+    xorg = Path(config['xorg_config'])
+    if xorg.exists():
+        validate_root_file(xorg)
+        h.xorg_mode()
+    else:
+        # Avoid overriding administrator flags unknowingly.
+        files = [Path('/etc/X11/xorg.conf'), *Path('/etc/X11/xorg.conf.d').glob('*.conf')]
+        if any(p.exists() and re.search(r'^\s*Option\s+"AutoAddGPU"', p.read_text(), re.I | re.M) for p in files):
+            raise Error('Existing AutoAddGPU configuration found; select/migrate it explicitly before installing.')
+    config.setdefault('installation_id', str(uuid.uuid4()))
+    config.setdefault('managed_files', {})
+    config.setdefault('xorg_original_mode', h.xorg_mode() if xorg.exists() else None)
+    config.setdefault('xorg_applied_mode', h.xorg_mode() if xorg.exists() else 'off')
+    integration = args.optional_gpu or Path(config['hook_path']).exists()
+    audio_policy = audio_monitor_policy(config) if integration else []
+    print(json.dumps(config, indent=2), flush=True)
+    for path, _ in audio_policy:
+        print('NVIDIA HDMI audio policy: ' + str(path), flush=True)
+    if args.dry_run:
+        return
+    # A private root state lock serializes hook replacement, preserving an active VM transaction.
+    fd = h.lock(installing=True) if h.STATE_DIR.exists() else None
+    changes = []
+    def put(path, data, mode):
+        old = None
+        if path.exists() or path.is_symlink():
+            validate_root_file(path)
+            old = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        changes.append((path, old))
+        write_file(path, data, mode)
+    try:
+        source = Path(__file__).resolve()
+        # Hook wrapper is replaced last, so every new invocation sees complete installed files.
+        core = source.with_name('nvidia_handoff_core.py').read_bytes()
+        ast.parse(core)
+        app = source.read_bytes();ast.parse(app)
+        put(Path('/opt/nvidia_handoff_core.py'), core, 0o644)
+        put(Path('/opt/nvidia-handoff'), app, 0o755)
+        if integration and not xorg.exists():
+            data = XORG_OFF
+            put(xorg, data, 0o644)
+            config['managed_files'][str(xorg)] = digest(data)
+        for path, data in audio_policy:
+            check_managed(path, data, config)
+            put(path, data, 0o644)
+            config['managed_files'][str(path)] = digest(data)
+        if integration and shutil.which('virsh'):
+            hook = Path(config['hook_path'])
+            existed = hook.exists()
+            check_managed(hook, HOOK, config)
+            put(hook, HOOK, 0o755)
+            config['managed_files'][str(hook)] = digest(HOOK)
+            if not existed:
+                # Refresh hook discovery only; never restart libvirt/QEMU or the desktop.
+                for daemon in ('virtqemud.service', 'libvirtd.service'):
+                    state = h.run('/usr/bin/systemctl', 'show', daemon, '-p', 'ActiveState', '--value')
+                    if state == 'active':
+                        h.run('/usr/bin/systemctl', 'kill', '--kill-whom=main', '--signal=HUP', daemon)
+        put(SETTINGS_PATH, (json.dumps(config, indent=2)+'\n').encode(), 0o644)
+        print('Installed. No GPU bindings, running guests or graphical sessions changed.', flush=True)
+        if audio_policy:
+            print('Restart WirePlumber in each logged-in desktop session or log in again to apply the HDMI audio policy. A restart may briefly interrupt host sound.', flush=True)
+    except BaseException:
+        # Restore files in reverse order, retaining runtime state throughout.
+        for path, old in reversed(changes):
+            if old is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_file(path, old[0], old[1])
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if args.optional_gpu:
+        print(run('/usr/bin/python3', '-I', '/opt/nvidia-handoff', 'enable-optional'), flush=True)
+
+
+def main(argv):
+    if argv[:1] == ['--install']:
+        return install(argv[1:])
+    if argv[:1] == ['--probe']:
+        h = load_core(trusted=False)
+        h.assert_x11()
+        print(json.dumps(h.discover(argv[1] if len(argv) > 1 else None), indent=2))
+        return
+    initialize()
+    if argv[:1] == ['--cleanup']:
+        parser = argparse.ArgumentParser(description='Remove NVIDIA handoff and restore its integration changes')
+        parser.add_argument('--dry-run', action='store_true', help='Show files, VM restoration and blockers without changing anything')
+        parser.add_argument('--yes', action='store_true', help='Confirm full removal')
+        return cleanup(parser.parse_args(argv[1:]))
+    if argv[:1] == ['--libvirt-hook']:
+        return load_hook().main(argv[1:])
+    if argv[:1] == ['enable-optional']:
+        return enable_optional_guests()
+    if argv[:1] == ['start-vm']:
+        parser = argparse.ArgumentParser(description='Start a VM with a one-time GPU configuration')
+        parser.add_argument('vm')
+        parser.add_argument('--without-gpu', action='store_true', help='Start without claiming or attaching the selected GPU')
+        args = parser.parse_args(argv[1:])
+        try:
+            ident = str(uuid.UUID(args.vm))
+        except ValueError:
+            ident = virsh('domuuid', args.vm)
+        return start_optional(ident, without_gpu=args.without_gpu)
+    if argv[:1] == ['--recover']:
+        return load_hook().main(argv)
+    if argv in (['gui'], ['--gui']):
+        return gui()
+    if argv[:1] in (['select'], ['--selection-worker']):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('mode')
+        parser.add_argument('target')
+        parser.add_argument('--job-id', default=None)
+        parser.add_argument('--status-uid', type=int)
+        parser.add_argument('--shutdown-owner', action='store_true')
+        parser.add_argument('--restart-session', action='store_true')
+        # Internal worker uses an option-shaped token; remove it before argparse.
+        args = parser.parse_args((['worker'] + argv[1:]) if argv[0] == '--selection-worker' else argv)
+        job = args.job_id or str(uuid.uuid4())
+        global OP_STATUS
+        if args.status_uid is not None:
+            if args.mode != 'worker' or os.geteuid() != 0:
+                raise Error('Internal progress option requires root worker')
+            OP_STATUS = status_file(args.status_uid, job)
+        fn = selection_worker if args.mode == 'worker' else select_destination
+        return fn(args.target, job, args.shutdown_owner, args.restart_session)
+    if len(argv) == 2 and argv[0] == '--worker' and argv[1] in ('connect', 'disconnect'):
+        return worker(argv[1])
+    if argv[:1] == ['run']:
+        return launch(argv[1:])
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('mode', choices=('status', 'connect', 'disconnect', 'run', 'gui'), nargs='?', default='status')
+    parser.add_argument('--restart-session', action='store_true', help='Allow login manager restart and logout of graphical sessions')
+    args = parser.parse_args(argv)
+    if args.mode == 'status':
+        status()
+    elif args.mode == 'gui':
+        gui()
+    else:
+        switch(args.mode, args.restart_session)
+
+
+if __name__ == '__main__':
+    try:
+        main(sys.argv[1:])
+    except Exception as exc:
+        print('nvidia-handoff:', exc, file=sys.stderr, flush=True)
+        sys.exit(1)
