@@ -24,6 +24,7 @@ class StatelessTests(unittest.TestCase):
         self.core = module('nvidia_handoff_core.py')
         self.app = module('nvidia-handoff')
         self.app.tag_guest_driver = Mock()
+        self.app.setup_guest_docker = Mock(return_value='Docker skipped.')
         self.addCleanup(os.umask, os.umask(0o077))
         self.tmp = tempfile.TemporaryDirectory(prefix='.test-', dir=ROOT)
         self.addCleanup(self.tmp.cleanup)
@@ -532,6 +533,177 @@ class StatelessTests(unittest.TestCase):
         self.assertIn('--simulate', install[0].args[2])
         self.assertTrue(all('--no-remove' in call.args[2] for call in install))
 
+    @contextlib.contextmanager
+    def docker_fixture(self, config=None, args=()):
+        self.app.Path = lambda path: self.root / str(path).lstrip('/')
+        proc = self.root / 'proc/1234'
+        proc.mkdir(parents=True)
+        (proc / 'exe').symlink_to('/usr/bin/dockerd')
+        (proc / 'cmdline').write_bytes(('dockerd\0' + '\0'.join(args) + '\0').encode())
+        path = self.root / 'etc/docker/daemon.json'
+        path.parent.mkdir(parents=True)
+        if config is not None:
+            path.write_text(json.dumps(config))
+        self.app.validate_root_file = Mock()
+        self.app.validate_root_path = Mock()
+        self.app.write_file = Mock(side_effect=lambda p, b, mode=0o644: p.write_bytes(b))
+        calls = []
+        def run(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ('systemctl', 'show'):
+                return '1234'
+            if args[0] == 'docker':
+                return json.dumps({'nvidia': {'path': '/usr/bin/nvidia-container-runtime'}} if
+                                  any('--signal=HUP' in a for a, k in calls) else {})
+            return ''
+        self.app.run = Mock(side_effect=run)
+        with self.owned_paths(), patch.dict(os.environ), patch.object(self.app.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name), \
+             patch.object(self.app.time, 'sleep'):
+            yield path, calls
+
+    def test_docker_merges_and_reloads_without_restarting_or_changing_defaults(self):
+        original = {'log-driver': 'journald', 'default-runtime': 'runc', 'runtimes': {'custom': {'path': 'custom'}}}
+        with self.docker_fixture(original, ('-H', 'fd://', '--config-file', '/etc/docker/daemon.json')) as (path, calls):
+            self.assertIn('without restarting', self.app.configure_docker())
+            result = json.loads(path.read_text())
+            self.assertEqual(result['log-driver'], original['log-driver'])
+            self.assertEqual(result['default-runtime'], 'runc')
+            self.assertEqual(result['runtimes']['custom'], original['runtimes']['custom'])
+            self.assertEqual(result['runtimes']['nvidia']['path'], '/usr/bin/nvidia-container-runtime')
+            self.assertTrue(any(a == ('dockerd', '-H', 'fd://', '--validate', '--config-file=/dev/stdin') for a, k in calls))
+            self.assertFalse(any('restart' in a or 'apt-get' in a for a, k in calls))
+            self.assertTrue(all('--host=unix:///run/docker.sock' in a for a, k in calls if a[0] == 'docker'))
+
+    def test_docker_absent_or_registered_does_not_write(self):
+        with patch.object(self.app.shutil, 'which', return_value=None):
+            self.app.run = Mock()
+            self.assertIn('not installed', self.app.configure_docker())
+            self.app.run.assert_not_called()
+        with self.docker_fixture() as (path, calls):
+            original = self.app.run.side_effect
+            self.app.run.side_effect = lambda *a, **k: json.dumps({'nvidia': {'path': 'nvidia-container-runtime'}}) if a[0] == 'docker' else original(*a, **k)
+            self.assertIn('already registered', self.app.configure_docker())
+            self.app.write_file.assert_not_called()
+
+    def test_docker_refuses_custom_flags_config_and_stopped_daemon(self):
+        for args in (('--rootless',), ('--add-runtime=foo=bar',), ('--config-file=/custom.json',)):
+            with self.subTest(args=args), self.docker_fixture(args=args):
+                with self.assertRaises(self.app.Error):
+                    self.app.configure_docker()
+                self.app.write_file.assert_not_called()
+            import shutil
+            shutil.rmtree(self.root / 'proc')
+            shutil.rmtree(self.root / 'etc')
+        with self.docker_fixture({'runtimes': {'nvidia': {'path': 'custom'}}}):
+            with self.assertRaisesRegex(self.app.Error, 'Preserving custom'):
+                self.app.configure_docker()
+            self.app.write_file.assert_not_called()
+            self.app.run.side_effect = None
+            self.app.run.return_value = '0'
+            with self.assertRaisesRegex(self.app.Error, 'stopped or rootless'):
+                self.app.configure_docker()
+
+    def test_docker_validation_conflict_and_reload_failure(self):
+        with self.docker_fixture({'debug': True}) as (path, calls):
+            original = self.app.run.side_effect
+            def command(*args, **kwargs):
+                if args[0] == 'dockerd':
+                    raise self.app.Error('invalid configuration')
+                return original(*args, **kwargs)
+            self.app.run.side_effect = command
+            with self.assertRaisesRegex(self.app.Error, 'invalid configuration'):
+                self.app.configure_docker()
+            self.app.write_file.assert_not_called()
+            def conflict(*args, **kwargs):
+                if args[0] == 'dockerd':
+                    path.write_text('{"debug":false}')
+                return original(*args, **kwargs)
+            self.app.run.side_effect = conflict
+            with self.assertRaisesRegex(self.app.Error, 'changed'):
+                self.app.configure_docker()
+            self.app.write_file.assert_not_called()
+            self.app.run.side_effect = lambda *a, **k: '{}' if a[0] == 'docker' else original(*a, **k)
+            with self.assertRaisesRegex(self.app.Error, 'No restart was attempted'):
+                self.app.configure_docker()
+            self.assertIn('nvidia', json.loads(path.read_text())['runtimes'])
+
+    def test_docker_toolkit_install_uses_existing_repository_and_preserves_packages(self):
+        with self.docker_fixture() as (path, calls):
+            original = self.app.run.side_effect
+            installed = False
+            def command(*args, **kwargs):
+                nonlocal installed
+                if args[:2] == ('apt-cache', 'policy'):
+                    return 'Candidate: 1.20.1-1'
+                if 'install' in args and '-y' in args:
+                    installed = True
+                return original(*args, **kwargs)
+            self.app.run.side_effect = command
+            with patch.object(self.app.shutil, 'which', side_effect=lambda name:
+                    None if name == 'nvidia-container-runtime' and not installed else '/usr/bin/' + name):
+                self.assertIn('registered', self.app.configure_docker())
+            packages = [a for a, k in calls if 'install' in a]
+            self.assertEqual(len(packages), 2)
+            self.assertIn('--simulate', packages[0])
+            self.assertTrue(all('--no-remove' in a and '--no-upgrade' in a and 'NEEDRESTART_MODE=l' in a for a in packages))
+            self.assertEqual(self.app.write_file.call_count, 1)
+
+    def test_docker_repository_install_and_conflict(self):
+        with self.docker_fixture() as (path, calls):
+            original = self.app.run.side_effect
+            installed = False
+            def command(*args, **kwargs):
+                nonlocal installed
+                if args[:2] == ('apt-cache', 'policy'):
+                    return 'Candidate: (none)'
+                if 'nvidia-container-toolkit' in args and '-y' in args:
+                    installed = True
+                return original(*args, **kwargs)
+            self.app.run.side_effect = command
+            def write(path, body, mode=0o644):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(body)
+            self.app.write_file.side_effect = write
+            response = Mock()
+            response.__enter__ = Mock(return_value=response)
+            response.__exit__ = Mock(return_value=False)
+            response.read.return_value = b'key'
+            with patch('urllib.request.urlopen', return_value=response) as fetch, \
+                 patch.object(self.app.subprocess, 'run', return_value=types.SimpleNamespace(stdout=b'dearmored-key')) as gpg, \
+                 patch.object(self.app.shutil, 'which', side_effect=lambda name:
+                    None if name == 'nvidia-container-runtime' and not installed else '/usr/bin/' + name):
+                self.assertIn('registered', self.app.configure_docker())
+                fetch.assert_called_once_with('https://nvidia.github.io/libnvidia-container/gpgkey', timeout=60)
+                self.assertIn('--dearmor', gpg.call_args.args[0])
+                repo = self.root / 'etc/apt/sources.list.d/nvidia-handoff-container-toolkit.list'
+                self.assertIn('signed-by=', repo.read_text())
+                self.assertNotIn('trusted=yes', repo.read_text())
+                self.assertEqual(self.app.write_file.call_count, 3)
+                installed = False
+                calls.clear()
+                repo.write_text('administrator change')
+                self.app.write_file.reset_mock()
+                with self.assertRaisesRegex(self.app.Error, 'Preserving existing repository'):
+                    self.app.configure_docker()
+                self.app.write_file.assert_not_called()
+
+    def test_guest_docker_payload_reuses_helpers_and_failure_keeps_gpu(self):
+        app = module('nvidia-handoff')
+        app.load_hook = Mock()
+        app.operation_status = Mock()
+        app.guest_exec = Mock(return_value=(0, 'Docker ready'))
+        self.assertEqual(app.setup_guest_docker('vm', 'job'), 'Docker ready')
+        call = app.guest_exec.call_args
+        self.assertEqual(call.args[:2], ('vm', '/usr/bin/python3'))
+        script = call.args[2][-1]
+        namespace = {}
+        exec(compile(script.rsplit('print(configure_docker())', 1)[0], '<guest>', 'exec'), namespace)
+        with patch.object(namespace['shutil'], 'which', return_value=None):
+            self.assertIn('not installed', namespace['configure_docker']())
+        app.guest_exec.return_value = (1, 'APT failed')
+        with self.assertRaisesRegex(app.Error, 'GPU remains attached.*APT failed'):
+            app.setup_guest_docker('vm', 'job')
+
     def test_preparation_defines_only_inactive_xml_and_rechecks_edits(self):
         self.configure_guest_devices()
         self.app.load_hook=lambda:self.core
@@ -670,6 +842,8 @@ class StatelessTests(unittest.TestCase):
         text=self.app.switch_confirmation('new',d,[],False,True)
         self.assertIn('driver license',text)
         self.assertIn('one graceful guest reboot',text)
+        self.assertIn('/etc/docker/daemon.json',text)
+        self.assertIn('without restarting containers',text)
 
     def test_ready_vm_dispatch_confirms_only_when_untagged(self):
         self.configure_guest_devices()
@@ -692,6 +866,9 @@ class StatelessTests(unittest.TestCase):
                 self.assertEqual(self.app.SwitchDialog.call_count, 0 if tagged else 1)
                 if not tagged:
                     self.assertFalse(self.app.SwitchDialog.call_args.kwargs['default_driver'])
+        window.current_target = 'vm'
+        self.app.GPUWindow.apply(window, software=True)
+        self.assertTrue(self.app.SwitchDialog.call_args.kwargs['default_driver'])
 
     @unittest.skipUnless(os.environ.get('NVIDIA_HANDOFF_GUI_TESTS') == '1', 'Enable mapped display checks explicitly')
     def test_confirmation_dialog_resizes_at_96_144_192_dpi(self):
@@ -721,7 +898,8 @@ class StatelessTests(unittest.TestCase):
                     root.update()
                     w,h=dialog.window.winfo_width(),dialog.window.winfo_height()
                     x,y=dialog.window.winfo_rootx(),dialog.window.winfo_rooty()
-                    for widget in (dialog.text,dialog.connect_button,dialog.cancel_button):
+                    for widget in (dialog.text,dialog.connect_button,dialog.cancel_button,
+                                   *[w for w in dialog.window.winfo_children() if w.winfo_class() == 'TCheckbutton']):
                         self.assertGreaterEqual(widget.winfo_rootx(),x)
                         self.assertGreaterEqual(widget.winfo_rooty(),y)
                         self.assertLessEqual(widget.winfo_rootx()+widget.winfo_width(),x+w)
@@ -729,6 +907,7 @@ class StatelessTests(unittest.TestCase):
                     widths.append(dialog.text.winfo_width())
                 self.assertGreater(widths[2],widths[1])
                 self.assertEqual(dialog.text.cget('wrap'),'word')
+                dialog.text.count('1.0', 'end', 'update', 'ypixels')  # Settle Tk's deferred wrap metrics.
                 dialog.text.yview_moveto(1)
                 root.update()
                 self.assertGreater(dialog.text.yview()[0],0)

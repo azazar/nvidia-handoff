@@ -520,6 +520,116 @@ def setup_guest_driver(ident, job, target):
     raise Error('Guest reboot was requested; NVIDIA readiness was not confirmed. GPU assignment is retained. Check Secure Boot, DKMS and guest driver logs.')
 
 
+def configure_docker():
+    """Run only inside the Debian guest, after explicit software-setup consent."""
+    if not shutil.which('dockerd'):
+        return 'Docker Engine is not installed; skipped.'
+    # Never follow a client context or change a rootless/remote daemon.
+    for key in list(os.environ):
+        if key.startswith('DOCKER_'):
+            del os.environ[key]
+    pid = run('systemctl', 'show', 'docker.service', '-p', 'MainPID', '--value')
+    if not pid.isdigit() or int(pid) <= 1:
+        raise Error('Docker is stopped or rootless; start the system Docker service and retry software setup.')
+    proc = Path('/proc') / pid
+    if (proc / 'exe').resolve().name != 'dockerd' or proc.lstat().st_uid != 0:
+        raise Error('Unsupported Docker service; configure its GPU runtime manually.')
+    args = (proc / 'cmdline').read_bytes().decode().rstrip('\0').split('\0')[1:]
+    config = Path('/etc/docker/daemon.json')
+    daemon_args = []
+    options = iter(args)
+    for arg in options:
+        if arg.split('=')[0] in ('--rootless', '--add-runtime'):
+            raise Error('Custom Docker runtime flags require manual GPU setup.')
+        if arg.split('=')[0] == '--config-file':
+            value = arg.split('=', 1)[1] if '=' in arg else next(options, '')
+            if Path(value) != config:
+                raise Error('Custom Docker configuration path requires manual GPU setup: ' + value)
+        else:
+            daemon_args.append(arg)
+    docker = ('docker', '--host=unix:///run/docker.sock')
+    def runtimes():
+        return json.loads(run(*docker, 'info', '--format', '{{json .Runtimes}}'))
+    active = runtimes()
+    runtime = shutil.which('nvidia-container-runtime')
+    if runtime and Path(active.get('nvidia', {}).get('path', '')).name == 'nvidia-container-runtime':
+        return 'Docker NVIDIA runtime is already registered.'
+    def read_config():
+        if config.exists() or config.is_symlink():
+            validate_root_file(config)
+            return config.read_bytes()
+        parent = config.parent
+        while not parent.exists():
+            parent = parent.parent
+        validate_root_path(parent)
+        return None
+    old = read_config()
+    data = json.loads(old) if old is not None else {}
+    if not isinstance(data, dict) or not isinstance(data.get('runtimes', {}), dict):
+        raise Error('Invalid Docker configuration; preserving it unchanged.')
+    existing = data.get('runtimes', {}).get('nvidia')
+    if existing is not None and (not isinstance(existing, dict) or
+            Path(existing.get('path', '')).name != 'nvidia-container-runtime'):
+        raise Error('Preserving custom NVIDIA runtime configuration; review it manually.')
+    if not runtime:
+        def apt(*packages):
+            for mode in ('--simulate', '-y'):
+                run('env', 'DEBIAN_FRONTEND=noninteractive', 'NEEDRESTART_MODE=l', 'apt-get',
+                    mode, '--no-remove', '--no-upgrade', '--no-install-recommends', 'install', *packages, timeout=1800)
+        run('apt-get', 'update', timeout=1800)
+        policy = run('apt-cache', 'policy', 'nvidia-container-toolkit')
+        if not re.search(r'Candidate: (?!\(none\))\S+', policy):
+            apt('ca-certificates', 'gnupg')
+            from urllib.request import urlopen
+            with urlopen('https://nvidia.github.io/libnvidia-container/gpgkey', timeout=60) as response:
+                key = response.read()
+            key = subprocess.run(['gpg', '--batch', '--no-options', '--homedir', '/etc/apt', '--dearmor'], input=key, capture_output=True, check=True, timeout=60).stdout
+            keyfile = Path('/usr/share/keyrings/nvidia-handoff-container-toolkit.gpg')
+            source = Path('/etc/apt/sources.list.d/nvidia-handoff-container-toolkit.list')
+            contents = ('deb [arch=amd64 signed-by=' + str(keyfile) +
+                        '] https://nvidia.github.io/libnvidia-container/stable/deb/amd64 /\n').encode()
+            for path, body in ((keyfile, key), (source, contents)):
+                if path.exists() or path.is_symlink():
+                    validate_root_file(path)
+                    if path.read_bytes() != body:
+                        raise Error('Preserving existing repository file: ' + str(path))
+                else:
+                    write_file(path, body)
+            run('apt-get', 'update', timeout=1800)
+        apt('nvidia-container-toolkit')
+        runtime = shutil.which('nvidia-container-runtime')
+        if not runtime:
+            raise Error('NVIDIA container runtime is still missing after package installation.')
+    # Merge only the runtime entry; retain the default runtime and all other settings.
+    data.setdefault('runtimes', {}).setdefault('nvidia', {'path': runtime, 'runtimeArgs': []})
+    changed = (json.dumps(data, indent=2) + '\n').encode()
+    run('dockerd', *daemon_args, '--validate', '--config-file=/dev/stdin', input=changed.decode())
+    if read_config() != old or run('systemctl', 'show', 'docker.service', '-p', 'MainPID', '--value') != pid:
+        raise Error('Docker configuration or process changed; retry software setup.')
+    mode = stat.S_IMODE(config.stat().st_mode) if old is not None else 0o644
+    if old is None or json.loads(old) != data:
+        write_file(config, changed, mode)
+    run('systemctl', 'kill', '--kill-whom=main', '--signal=HUP', 'docker.service')
+    for _ in range(5):
+        if 'nvidia' in runtimes():
+            return 'Docker NVIDIA runtime registered; configuration reloaded without restarting containers.'
+        time.sleep(2)
+    raise Error('Docker did not register the NVIDIA runtime after reload. Configuration retained; check its journal. No restart was attempted.')
+
+
+def setup_guest_docker(ident, job):
+    import inspect
+    operation_status(load_hook(), job, 'running', 'Checking Debian guest Docker GPU support…', ident)
+    # Reuse the same validated atomic writer and command runner in the guest.
+    helpers = (run, validate_root_path, validate_root_file, make_config_directory, write_file, configure_docker)
+    script = ('import os, json, re, stat, subprocess, shutil, time\nfrom pathlib import Path\nError = RuntimeError\n' +
+              '\n'.join(inspect.getsource(fn) for fn in helpers) + '\nprint(configure_docker())\n')
+    code, output = guest_exec(ident, '/usr/bin/python3', ['-I', '-c', script], timeout=1800)
+    if code:
+        raise Error('GPU remains attached; guest Docker setup failed: ' + output[-4000:])
+    return output.strip()
+
+
 def mark_claim(h, ident):
     state = h.load()
     if state is None:
@@ -722,7 +832,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False, setup_dri
     h = load_hook()
     operation_status(h, job, 'running', 'Checking current GPU attachment…', target)
     def completed(domain):
-        detail = setup_guest_driver(target, job, target) if setup_driver else ''
+        detail = (setup_guest_driver(target, job, target) + ' ' + setup_guest_docker(target, job)) if setup_driver else ''
         operation_status(h, job, 'done', 'GPU attached to VM ' + domain['name'] + ('. ' + detail if detail else ''), target)
     # Every libvirt operation below occurs outside the shared GPU lock.
     try:
@@ -913,7 +1023,12 @@ def switch_confirmation(label, selected, stops, restart, install_driver):
             lines.append('Verify Debian 12/13 through the guest agent. Install NVIDIA drivers only if missing, '
                          'using the signed NVIDIA APT repository if needed. This accepts the NVIDIA driver license '
                          'and permits one graceful guest reboot. Save successful driver verification in this VM’s metadata.')
-            lines.append('Guest package changes: /etc/apt, /usr, /lib, /boot, /var, /run and /tmp.')
+            lines.append('If Docker Engine is installed, configure its NVIDIA Container Toolkit using a signed APT repository if needed. '
+                         'Merge /etc/docker/daemon.json and reload Docker without restarting containers. '
+                         'Repository/key files may be added under /etc/apt and /usr/share/keyrings; '
+                         'toolkit packages also use /etc/nvidia-container-runtime. Python libraries are not installed.')
+            lines.append('Guest package changes: /etc/apt, /usr, /lib, /boot, /var, /run and /tmp. '
+                         'Installed packages and repositories remain after handoff cleanup.')
     if stops:
         lines.append('Gracefully shut down: ' + ', '.join(d['name'] for d in stops) + '.')
     if restart:
@@ -953,7 +1068,7 @@ class SwitchDialog:
             self.text.insert('1.0', text_for_driver(self.install_driver.get()))
             self.text.configure(state='disabled')
         if offer_driver:
-            ttk.Checkbutton(window, text='Install missing Debian NVIDIA drivers',
+            ttk.Checkbutton(window, text='Set up drivers and Docker',
                             variable=self.install_driver, command=refresh).grid(
                                 row=1, column=0, sticky='w', padx=px(24), pady=(0, px(8)))
         buttons = ttk.Frame(window, padding=(px(16), px(8), px(16), px(16)))
@@ -1007,6 +1122,9 @@ class GPUWindow:
         self.starting = None
         self.shown_error = None
         self.messages = queue.Queue()
+        self.software_menu = menu = tk.Menu(root)
+        menu.add_command(label='VM software…', command=lambda: self.apply(software=True))
+        root.configure(menu=menu)
         root.title('NVIDIA handoff — ' + LABEL)
         px, body, self.title_font, columns = configure_gui_style(root)
         self.px = px
@@ -1077,6 +1195,7 @@ class GPUWindow:
         selected = self.tree.selection()
         row = self.rows.get(selected[0]) if selected else None
         record = self.selected_vm()
+        self.software_menu.entryconfigure(0, state='normal' if not self.busy and record and record['eligible'] else 'disabled')
         self.start_button.configure(state='normal' if not self.busy and record and
             record['eligible'] and record['state'] == 'shut off' and not record.get('startup_gpu', False) else 'disabled')
         self.apply_button.configure(state='normal' if row and row[4] and not self.busy and
@@ -1157,13 +1276,13 @@ class GPUWindow:
         self.start_process(program_command('start-vm', record['uuid'], '--without-gpu'),
                            'Starting ' + self.starting + ' without GPU…')
 
-    def apply(self):
+    def apply(self, software=False):
         from tkinter import messagebox
         selected = self.tree.selection()
         if not selected or self.busy:
             return
         target = selected[0]
-        if target == self.current_target:
+        if target == self.current_target and not software:
             return
         try:
             stops, restart = operation_plan(target, self.records, getattr(self, 'attached', False))
@@ -1172,13 +1291,15 @@ class GPUWindow:
             return
         label = self.rows[target][1]
         record = self.selected_vm()
+        if software and (not record or not record['eligible']):
+            return
         needs_preparation = bool(record and not record.get('prepared', record.get('optional', False)))
-        offer_driver = bool(record and record.get('driver_ready') is not True)
+        offer_driver = bool(record)
         install_driver = False
-        if not skip_switch_confirmation(record, stops, restart):
+        if software or not skip_switch_confirmation(record, stops, restart):
             confirmed, install_driver = SwitchDialog(self.root,
                 lambda install: switch_confirmation(label, record, stops, restart, install),
-                offer_driver=offer_driver, default_driver=needs_preparation).show()
+                offer_driver=offer_driver, default_driver=software or needs_preparation).show()
             if not confirmed:
                 return
         self.job = str(uuid.uuid4())
@@ -1832,7 +1953,7 @@ def main(argv):
         parser.add_argument('--shutdown-owner', action='store_true')
         parser.add_argument('--restart-session', action='store_true')
         parser.add_argument('--prepare-vm', action='store_true', help='Authorize missing VM hardware preparation')
-        parser.add_argument('--setup-driver', action='store_true', help='Check/install Debian guest NVIDIA drivers; permit one guest reboot if needed')
+        parser.add_argument('--setup-driver', action='store_true', help='Configure Debian guest drivers and installed Docker GPU runtime; permit one guest reboot if needed')
         # Internal worker uses an option-shaped token; remove it before argparse.
         args = parser.parse_args((['worker'] + argv[1:]) if argv[0] == '--selection-worker' else argv)
         job = args.job_id or str(uuid.uuid4())

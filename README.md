@@ -8,6 +8,7 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 
 - **GPU destinations:** idle, CUDA without Xorg, Xorg with NVIDIA PRIME, or a virtual machine.
 - **Automatic Debian VM setup:** Connect prepares missing passthrough hardware and installs a hardware-matched NVIDIA driver through the QEMU guest agent. Prepared VMs appear first; unprepared VMs are listed too.
+- **Docker GPU support in Debian VMs:** guest software setup configures the NVIDIA runtime when Docker Engine is installed, preserving Docker settings and reloading without a daemon restart.
 - **Optional VM passthrough:** start a VM with or without the GPU; ordinary VM starts are GPU-free after setup.
 - **Live attachment:** connect the GPU and its associated PCI functions to a prepared running VM without restarting it.
 - **Per-run assignment:** a VM keeps the GPU until it powers off; its next ordinary start is GPU-free.
@@ -24,6 +25,7 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 - An X11 desktop and login screen. X.Org and XLibre are supported with compatible NVIDIA drivers; Wayland and Xwayland are unsupported.
 - Tkinter for the GUI; `lspci`, kmod tools, `udevadm`, systemd tools, and `pkexec` with a desktop authentication agent.
 - For automatic VM setup: libvirt, `virsh`, `qemu:///system`, isolated IOMMU groups, and a persistent x86_64 QEMU/KVM q35 or i440fx guest running Debian 12 or 13 (amd64). The guest must already have `qemu-guest-agent` installed, enabled, and permitted to run guest commands. Missing guest hardware/channel configuration is prepared automatically; the guest agent itself cannot be installed without an existing access method.
+- Guest Docker setup also requires system Python 3 and an active rootful `docker.service` using `/etc/docker/daemon.json` and `/run/docker.sock`. Rootless Docker, custom configuration paths and runtime flags require manual setup.
 - Guest driver installation requires network access and APT, plus headers for the running guest kernel. Secure Boot signing-key enrollment, if required, must be completed manually. Live attachment also requires guest OS and driver hotplug support.
 
 Each operation manages one selected GPU and its associated NVIDIA PCI functions, including HDMI audio and any GPU USB controllers. The display manager is detected automatically, with a per-command override. GPU and guest compatibility varies by configuration.
@@ -71,7 +73,7 @@ Open from your normal X11 session:
 | Xorg | Enable NVIDIA PRIME for host games |
 | A VM | Prepare and connect the GPU; install missing Debian drivers |
 
-Prepared VMs are listed before unprepared VMs. Unsupported VM architectures or transient definitions remain visible with an explanation. Select a destination and click **Connect**. Ready VMs with a successful driver-verification tag, or a successful live driver check, skip the ordinary connection confirmation. Other ready VMs get a short confirmation without preparation warnings. A conflicting live driver check, missing preparation, planned VM shutdown, or desktop restart keeps confirmation enabled. The resizable confirmation wraps and scrolls its text while keeping action buttons visible. Driver installation is a separate checkbox, off by default for prepared VMs. The button is disabled for an already active destination with a working driver, or while an operation is in progress. If a connected guest’s NVIDIA driver is unavailable or cannot be verified, Connect remains available to finish Debian setup. Partial VM attachments can be completed through the same action.
+Prepared VMs are listed before unprepared VMs. Unsupported VM architectures or transient definitions remain visible with an explanation. Select a destination and click **Connect**. Ready VMs with a successful driver-verification tag, or a successful live driver check, skip the ordinary connection confirmation. Other ready VMs get a short confirmation without preparation warnings. A conflicting live driver check, missing preparation, planned VM shutdown, or desktop restart keeps confirmation enabled. The resizable confirmation wraps and scrolls its text while keeping action buttons visible. Debian GPU software setup is a separate checkbox, off by default for prepared VMs; it verifies drivers and configures an installed Docker Engine. **VM software…** opens this setup confirmation for the selected VM, including one already using the GPU. The button is disabled for an already active destination with a working driver, or while an operation is in progress. If a connected guest’s NVIDIA driver is unavailable or cannot be verified, Connect remains available to finish Debian setup. Partial VM attachments can be completed through the same action.
 
 **Start without GPU** starts a selected shut-off VM with GPU-free startup settings. **Refresh** updates ownership and VM status. **Full cleanup…** opens application removal.
 
@@ -87,6 +89,12 @@ The guest agent identifies the actual operating system before package changes. A
 
 The setup confirmation authorizes these guest package changes, the NVIDIA driver license, and one graceful guest reboot if the new driver cannot initialize immediately. Driver readiness is checked again after reboot. Successful verification adds `driver-verified="yes"` to the existing optional-GPU metadata in the inactive VM definition. This records completed setup, not current GPU ownership; a failed live check overrides the tag. The tag appears as **drivers verified** in the VM list and is removed with the handoff metadata during cleanup. Administrator authentication remains required when applicable. Failures retain the GPU assignment and report what still needs attention. A missing agent, unsupported guest OS, network/package failure, or required Secure Boot enrollment is reported rather than treated as success.
 
+If Docker Engine is installed inside the guest, software setup checks its live NVIDIA runtime registration. It installs the NVIDIA Container Toolkit only when the runtime is missing, using an existing APT candidate or adding NVIDIA’s signed container-toolkit repository. The new repository files, when needed, are `/etc/apt/sources.list.d/nvidia-handoff-container-toolkit.list` and `/usr/share/keyrings/nvidia-handoff-container-toolkit.gpg`. Package removal and upgrades of already-installed requested packages are disabled.
+
+Setup validates and atomically merges the NVIDIA runtime entry in `/etc/docker/daemon.json`, preserving other runtimes, the default runtime, and unrelated settings. It signals Docker to reload and checks runtime registration; it does not restart Docker, launch containers, or download container images. A failed reload retains the validated configuration and reports the problem. An absent Docker Engine is skipped; a stopped or unsupported daemon requires manual attention. Registration is verified, but no container CUDA workload is run automatically.
+
+This configures Docker inside Debian VMs only. It does not install Docker itself, Python libraries, PyTorch, or `libtorch-dev`, and does not configure host Docker. Toolkit packages and repositories remain under the guest package manager after application cleanup. See the [NVIDIA Container Toolkit guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and [Docker configuration reload documentation](https://docs.docker.com/reference/cli/dockerd/#configuration-reload-behavior).
+
 See [NVIDIA's Debian installation guide](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/debian.html), [driver assistant](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/driver-assistant.html), and [libvirt PCI hotplug](https://www.libvirt.org/pci-hotplug.html).
 
 For CLI setup, use the VM UUID with explicit preparation consent:
@@ -95,7 +103,7 @@ For CLI setup, use the VM UUID with explicit preparation consent:
 sudo /opt/nvidia-handoff select VM_UUID --prepare-vm --setup-driver
 ```
 
-`--prepare-vm` permits missing VM hardware setup; `--setup-driver` separately permits Debian driver installation and one guest reboot if needed. Omit both for a prepared VM when only connecting its GPU. Add `--shutdown-owner` only when you authorize a required graceful VM shutdown, and `--restart-session` only when you authorize an Xorg session restart. Host and guest changes outside the permitted filesystem scope must be reviewed and authorized before execution.
+`--prepare-vm` permits missing VM hardware setup; `--setup-driver` separately permits Debian GPU software setup: missing driver installation, one guest reboot if needed, and NVIDIA runtime configuration for an installed Docker Engine. Use it again for an already connected VM to set up Docker without changing GPU ownership. Omit both for a prepared VM when only connecting its GPU. Add `--shutdown-owner` only when you authorize a required graceful VM shutdown, and `--restart-session` only when you authorize an Xorg session restart. Host and guest changes outside the permitted filesystem scope must be reviewed and authorized before execution.
 
 The existing `enable-optional` command remains available for converting manually configured passthrough definitions to GPU-free ordinary startup without guest package changes:
 
