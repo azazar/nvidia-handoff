@@ -7,6 +7,7 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 ## Features
 
 - **GPU destinations:** idle, CUDA without Xorg, Xorg with NVIDIA PRIME, or a virtual machine.
+- **Automatic Debian VM setup:** Connect prepares missing passthrough hardware and installs a hardware-matched NVIDIA driver through the QEMU guest agent. Prepared VMs appear first; unprepared VMs are listed too.
 - **Optional VM passthrough:** start a VM with or without the GPU; ordinary VM starts are GPU-free after setup.
 - **Live attachment:** connect the GPU and its associated PCI functions to a prepared running VM without restarting it.
 - **Per-run assignment:** a VM keeps the GPU until it powers off; its next ordinary start is GPU-free.
@@ -21,7 +22,8 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 - A secondary, non-boot NVIDIA GPU with no connected display, plus a separate primary GPU for the desktop.
 - An X11 desktop and login screen. X.Org and XLibre are supported with compatible NVIDIA drivers; Wayland and Xwayland are unsupported.
 - Tkinter for the GUI; `lspci`, kmod tools, `udevadm`, systemd tools, and `pkexec` with a desktop authentication agent.
-- For VM passthrough: libvirt, `virsh`, `qemu:///system`, isolated IOMMU groups, and suitable guest PCIe ports. Live attachment also requires guest OS and driver hotplug support.
+- For automatic VM setup: libvirt, `virsh`, `qemu:///system`, isolated IOMMU groups, and a persistent x86_64 QEMU/KVM q35 or i440fx guest running Debian 12 or 13 (amd64). The guest must already have `qemu-guest-agent` installed, enabled, and permitted to run guest commands. Missing guest hardware/channel configuration is prepared automatically; the guest agent itself cannot be installed without an existing access method.
+- Guest driver installation requires network access and APT, plus headers for the running guest kernel. Secure Boot signing-key enrollment, if required, must be completed manually. Live attachment also requires guest OS and driver hotplug support.
 
 Each operation manages one selected GPU and its associated NVIDIA PCI functions, including HDMI audio and any GPU USB controllers. The display manager is detected automatically, with a per-command override. GPU and guest compatibility varies by configuration.
 
@@ -66,31 +68,39 @@ Open from your normal X11 session:
 | None | Park the GPU idle, normally on VFIO when isolation permits |
 | CUDA without Xorg | Bind NVIDIA and load UVM for compute |
 | Xorg | Enable NVIDIA PRIME for host games |
-| A prepared VM | Start it with the GPU or attach to the running guest |
+| A VM | Prepare and connect the GPU; install missing Debian drivers |
 
-Select a destination and click **Connect**. The button is disabled for an already active destination or while an operation is in progress. Partial VM attachments can be completed through the same action.
+Prepared VMs are listed before unprepared VMs. Unsupported VM architectures or transient definitions remain visible with an explanation. Select a destination and click **Connect**. The button is disabled for an already active destination with a working driver, or while an operation is in progress. If a connected guest’s NVIDIA driver is unavailable or cannot be verified, Connect remains available to finish Debian setup. Partial VM attachments can be completed through the same action.
 
 **Start without GPU** starts a selected shut-off VM with GPU-free startup settings. **Refresh** updates ownership and VM status. **Full cleanup…** opens application removal.
 
-The GUI shows the current GPU destination and distinguishes VMs running with the GPU, without it, or with only some PCI functions attached. Xorg transitions and graceful shutdown of another GPU-owning VM require confirmation.
+The GUI shows the current GPU destination and distinguishes VMs running with the GPU, without it, or with only some PCI functions attached. Its confirmation describes VM definition changes, guest package/repository installation, and any graceful shutdown or guest reboot needed. Xorg transitions and shutdown of another GPU-owning VM also require confirmation.
 
 ## VM setup
 
-Configure all selected GPU PCI functions in each intended VM's inactive definition, with the PCIe ports needed for passthrough and hotplug. Enable optional GPU support:
+No manual PCI passthrough preparation is required for automatic setup. Select the VM and click **Connect**. After confirmation, the script creates missing GPU function templates, adds PCI capacity and a guest-agent channel when necessary, and preserves GPU-free ordinary startup. Existing unrelated VM devices and metadata are preserved.
+
+A running VM with available PCI capacity receives the GPU live. If it needs new controllers or a guest-agent channel, Connect requests permission for a graceful shutdown and fresh start. It never forces a shutdown or removes saved guest memory.
+
+The guest agent identifies the actual operating system before package changes. Automatic driver setup supports Debian 12 and 13 amd64 only. A working driver for the selected GPU is left untouched. Otherwise, the script installs matching kernel headers, adds NVIDIA's signed APT repository using its official keyring package when needed, and uses NVIDIA's driver assistant to select the appropriate driver packages. Missing Debian contrib/non-free components are enabled in a separate APT source without overwriting existing source files. Package changes are simulated first and package removal is refused.
+
+The setup confirmation authorizes these guest package changes, the NVIDIA driver license, and one graceful guest reboot if the new driver cannot initialize immediately. Driver readiness is checked again after reboot. Failures retain the GPU assignment and report what still needs attention. A missing agent, unsupported guest OS, network/package failure, or required Secure Boot enrollment is reported rather than treated as success.
+
+See [NVIDIA's Debian installation guide](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/debian.html), [driver assistant](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/driver-assistant.html), and [libvirt PCI hotplug](https://www.libvirt.org/pci-hotplug.html).
+
+For CLI setup, use the VM UUID with explicit preparation consent:
+
+```sh
+sudo /opt/nvidia-handoff select VM_UUID --prepare-vm
+```
+
+Add `--shutdown-owner` only when you authorize a required graceful VM shutdown, and `--restart-session` only when you authorize an Xorg session restart. Host and guest changes outside the permitted filesystem scope must be reviewed and authorized before execution.
+
+The existing `enable-optional` command remains available for converting manually configured passthrough definitions to GPU-free ordinary startup without guest package changes:
 
 ```sh
 sudo /opt/nvidia-handoff enable-optional
 ```
-
-This configures all matching persistent VMs for GPU-free ordinary starts and records their GPU device templates. Running VM hardware remains unchanged.
-
-For a new installation, optional VM setup can be included in installation:
-
-```sh
-sudo /usr/bin/python3 -I ./nvidia-handoff --install --optional-gpu
-```
-
-PCIe ports needed for live attachment must exist before the guest starts. See [libvirt PCI topology and hotplug](https://www.libvirt.org/pci-hotplug.html).
 
 ## Starting and connecting VMs
 
@@ -106,7 +116,7 @@ The GPU boot command can fall back to GPU-free startup when the GPU cannot be cl
 
 Ordinary starts from virt-manager or `virsh start` use the persistent GPU-free definition. An explicit GPU boot uses a configuration for that run only. The GPU remains connected until the VM powers off; a reboot inside the guest retains the same hardware.
 
-To attach to a running prepared VM, select it and click **Connect**. The attachment affects the running guest only. Successful NVIDIA driver initialization after hotplug depends on the guest configuration. See [libvirt attach-device](https://www.libvirt.org/manpages/virsh.html#attach-device).
+To attach to a running VM, select it and click **Connect**. Missing preparation is handled by the same action; new PCI controllers or a missing agent channel require a confirmed shutdown and start. The attachment affects the running guest only. Successful NVIDIA driver initialization after hotplug depends on the guest configuration. See [libvirt attach-device](https://www.libvirt.org/manpages/virsh.html#attach-device).
 
 Fresh boot requires any managed save state to be resumed or removed explicitly in virt-manager first. Both VM names and UUIDs are accepted.
 
@@ -146,7 +156,7 @@ sudo /opt/nvidia-handoff --cleanup
 
 The GUI provides the same operation through **Full cleanup…**. Interactive CLI removal asks for `REMOVE`; `--yes` confirms noninteractive removal.
 
-Cleanup requires an idle GPU and no active transition. It restores host GPU bindings and the original Xorg policy, removes owned integration and runtime files, and leaves VM startup GPU-free. Administrator-modified integration files block removal for review. The source checkout and journal history remain. Log in again after cleanup to restore HDMI audio monitoring.
+Cleanup requires an idle GPU and no active transition. It restores host GPU bindings and the original Xorg policy, removes owned integration and runtime files, and leaves VM startup GPU-free. Administrator-modified integration files block removal for review. Unused PCI controllers and guest-agent channels created by automatic preparation are removed from inactive definitions; devices subsequently used by other VM hardware are preserved. Installed guest driver packages and APT repositories remain under the guest package manager. The source checkout and journal history remain. Log in again after cleanup to restore HDMI audio monitoring.
 
 ## Logs
 

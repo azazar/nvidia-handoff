@@ -8,6 +8,8 @@ Full uninstall: --cleanup [--dry-run] [--yes].
 Debian with systemd, NVIDIA driver and X.Org or XLibre; Wayland is refused.
 """
 import argparse
+import base64
+import shlex
 import hashlib
 import json
 import queue
@@ -341,6 +343,160 @@ def enable_optional_guests():
         print('Enabled optional GPU for ' + ET.fromstring(xml).findtext('name'), flush=True)
 
 
+def prepare_vm_definition(ident):
+    h = load_hook()
+    if not re.search(r'^Persistent:\s+yes$', virsh('dominfo', ident), re.M):
+        raise Error('Automatic preparation requires a persistent VM')
+    old = virsh('dumpxml', '--inactive', ident)
+    changed = h.prepare_guest_xml(old)
+    if ET.tostring(ET.fromstring(old)) == ET.tostring(ET.fromstring(changed)):
+        return
+    if ET.tostring(ET.fromstring(virsh('dumpxml', '--inactive', ident))) != ET.tostring(ET.fromstring(old)):
+        raise Error('VM definition changed during preparation; retry')
+    virsh_input(changed, 'define', '/dev/stdin', '--validate')
+
+
+def guest_agent(ident, command, arguments=None):
+    request = {'execute': command}
+    if arguments is not None:
+        request['arguments'] = arguments
+    response = json.loads(virsh('qemu-agent-command', ident, json.dumps(request), '--timeout', '10'))
+    if 'error' in response:
+        raise Error('Guest agent: ' + str(response['error']))
+    return response['return']
+
+
+def guest_exec(ident, path, args=(), timeout=60):
+    process = guest_agent(ident, 'guest-exec', {'path': path, 'arg': list(args), 'capture-output': True})
+    deadline = time.monotonic() + timeout
+    while True:
+        result = guest_agent(ident, 'guest-exec-status', {'pid': process['pid']})
+        if result.get('exited'):
+            output = ''.join(base64.b64decode(result.get(key, '')).decode(errors='replace')
+                             for key in ('out-data', 'err-data'))
+            return result.get('exitcode', -1), output
+        if time.monotonic() >= deadline:
+            raise Error('Guest command timed out; process ' + str(process['pid']) +
+                        ' may still be running. Check it in the guest before retrying.')
+        time.sleep(.5)
+
+
+def debian_guest(ident, wait=False):
+    deadline = time.monotonic() + (120 if wait else 0)
+    while True:
+        try:
+            info = guest_agent(ident, 'guest-get-osinfo')
+            break
+        except Error:
+            if time.monotonic() >= deadline:
+                raise Error('QEMU guest agent unavailable. Install and enable qemu-guest-agent inside this VM, then retry Connect. Guest software cannot be installed without guest access.')
+            time.sleep(2)
+    version = str(info.get('version-id', '')).split('.')[0]
+    if info.get('id') != 'debian' or version not in ('12', '13'):
+        raise Error('Automatic guest driver setup supports Debian 12 and 13 only; detected ' + info.get('pretty-name', 'unknown OS'))
+    code, arch = guest_exec(ident, '/usr/bin/dpkg', ['--print-architecture'])
+    if code or arch.strip() != 'amd64':
+        raise Error('Automatic NVIDIA guest setup requires Debian amd64')
+    return version
+
+
+def guest_driver_ready(ident):
+    try:
+        code, output = guest_exec(ident, '/usr/bin/nvidia-smi',
+                                 ['--query-gpu=pci.device_id', '--format=csv,noheader,nounits'])
+    except Error:
+        return False
+    device = next(d['device'] for d in SETTINGS['devices'] if d['bdf'] == GPU)
+    wanted = (int(device, 16) << 16) | 0x10de
+    return code == 0 and any(re.fullmatch(r'0x[0-9a-fA-F]+', line.strip()) and
+                             int(line.strip(), 16) == wanted for line in output.splitlines())
+
+
+GUEST_BOOTSTRAP = r"""
+set -eu
+export DEBIAN_FRONTEND=noninteractive LC_ALL=C
+. /etc/os-release
+test "$ID" = debian
+test "$(printf '%s' "$VERSION_ID" | cut -d. -f1)" = "$1"
+test "$(dpkg --print-architecture)" = amd64
+for flag in /sys/firmware/efi/efivars/SecureBoot-*; do
+    if test -f "$flag" && test "$(od -An -tu1 -j4 -N1 "$flag" | tr -d ' ')" != 0; then
+        echo 'Secure Boot requires signing-key enrollment in the guest before automatic driver installation.' >&2
+        exit 1
+    fi
+done
+apt-get update
+apt-get install -y --no-remove --no-install-recommends ca-certificates wget "linux-headers-$(uname -r)"
+if ! apt-cache policy glx-alternative-nvidia | grep -Eq 'Candidate: [^ (]'; then
+    policy=/etc/apt/sources.list.d/nvidia-handoff.sources
+    text=$(printf 'Types: deb\nURIs: https://deb.debian.org/debian\nSuites: %s\nComponents: contrib non-free non-free-firmware\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "$VERSION_CODENAME")
+    if test -e "$policy" || test -L "$policy"; then
+        printf '%s\n' "$text" | cmp -s - "$policy" || { echo 'Preserving existing APT policy' >&2; exit 1; }
+    else
+        (set -C; printf '%s\n' "$text" > "$policy")
+        chmod 644 "$policy"
+    fi
+fi
+if ! command -v nvidia-driver-assistant >/dev/null; then
+    keyring=$(mktemp /var/cache/apt/archives/nvidia-handoff-keyring.XXXXXX.deb)
+    trap 'rm -f "$keyring"' EXIT HUP INT TERM
+    wget --https-only -O "$keyring" "https://developer.download.nvidia.com/compute/cuda/repos/debian$1/x86_64/cuda-keyring_1.1-1_all.deb"
+    dpkg -i "$keyring"
+    rm -f "$keyring"
+    trap - EXIT HUP INT TERM
+fi
+apt-get update
+apt-get install -y --no-remove --no-install-recommends nvidia-driver-assistant
+"""
+
+
+def recommended_driver_packages(output):
+    for line in output.splitlines():
+        match = re.fullmatch(r'\s*(?:sudo\s+)?apt(?:-get)?\s+install\s+(?:-y\s+)?(.+)', line)
+        if match:
+            packages = shlex.split(match[1])
+            if packages and all(re.fullmatch(r'[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?(?:=[A-Za-z0-9+.:~_-]+)?', p) for p in packages):
+                return packages
+    raise Error('NVIDIA driver assistant did not provide a safe package recommendation: ' + output[-2000:])
+
+
+def setup_guest_driver(ident, job, target):
+    h = load_hook()
+    version = debian_guest(ident, wait=True)
+    if guest_driver_ready(ident):
+        return 'Debian NVIDIA driver is ready.'
+    operation_status(h, job, 'running', 'Installing Debian guest NVIDIA driver packages; this may take several minutes…', target)
+    code, output = guest_exec(ident, '/bin/sh', ['-c', GUEST_BOOTSTRAP, 'nvidia-handoff', version], timeout=1800)
+    if code:
+        raise Error('GPU remains attached; guest driver preparation failed: ' + output[-4000:])
+    code, output = guest_exec(ident, '/usr/bin/env', ['LC_ALL=C', '/usr/bin/nvidia-driver-assistant'])
+    if code:
+        raise Error('GPU remains attached; NVIDIA cannot recommend a supported driver: ' + output[-4000:])
+    packages = recommended_driver_packages(output)
+    for flags in (['--simulate'], ['-y']):
+        code, output = guest_exec(ident, '/usr/bin/env', ['DEBIAN_FRONTEND=noninteractive',
+            '/usr/bin/apt-get', *flags, '--no-remove', 'install', *packages], timeout=1800)
+        if code:
+            raise Error('GPU remains attached; guest package operation failed: ' + output[-4000:])
+    if guest_driver_ready(ident):
+        return 'Debian NVIDIA driver installed and ready.'
+    code, old_boot = guest_exec(ident, '/bin/cat', ['/proc/sys/kernel/random/boot_id'])
+    if code or not re.fullmatch(r'[0-9a-f-]{36}\s*', old_boot):
+        raise Error('Drivers installed; guest reboot is required. Reboot it manually, then retry Connect.')
+    operation_status(h, job, 'running', 'Drivers installed; gracefully rebooting the selected Debian guest once…', target)
+    virsh('reboot', ident, '--mode', 'agent')
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        time.sleep(3)
+        try:
+            code, boot = guest_exec(ident, '/bin/cat', ['/proc/sys/kernel/random/boot_id'])
+            if not code and boot.strip() != old_boot.strip() and guest_driver_ready(ident):
+                return 'Debian NVIDIA driver ready after guest reboot.'
+        except Error:
+            pass
+    raise Error('Guest reboot was requested; NVIDIA readiness was not confirmed. GPU assignment is retained. Check Secure Boot, DKMS and guest driver logs.')
+
+
 def mark_claim(h, ident):
     state = h.load()
     if state is None:
@@ -474,10 +630,11 @@ def pci_entries(xml):
     return root, entries
 
 
-def inventory():
+def inventory(check_drivers=False):
     if not shutil.which('virsh'):
         return []
     result = []
+    h = load_hook() if SETTINGS else None
     for ident in virsh('list', '--all', '--uuid').splitlines():
         ident = ident.strip()
         if not ident:
@@ -489,17 +646,24 @@ def inventory():
         persistent = info.get('Persistent', '').strip() == 'yes'
         root, entries = pci_entries(virsh('dumpxml', '--inactive', ident) if persistent else virsh('dumpxml', ident))
         state = virsh('domstate', ident)
-        _, live = pci_entries(virsh('dumpxml', ident)) if state != 'shut off' else (None, [])
-        h = load_hook() if SETTINGS else None
+        live_root, live = pci_entries(virsh('dumpxml', ident)) if state != 'shut off' else (None, [])
         optional = h.optional_devices(root) if h is not None else []
         if optional:
             _, candidates = pci_entries('<domain><devices>' + ''.join(ET.tostring(d, encoding='unicode') for d in optional) + '</devices></domain>')
         else:
             candidates = entries
         target = [entry for entry in candidates if entry[0] in BDFS]
-        result.append({'uuid': ident, 'name': root.findtext('name'), 'state': state,
-                       'optional': bool(optional), 'startup_gpu': any(bdf in BDFS for bdf, _ in entries), 'pci': bool(entries or optional), 'eligible': len(target) == len(BDFS) and
-                       {e[0] for e in target} == set(BDFS) and all(e[1] in (None, 'no', 'yes') for e in target),
+        prepared = (bool(optional) and len(target) == len(BDFS) and {e[0] for e in target} == set(BDFS))
+        supported = persistent and h is not None and h.guest_supported(root)
+        missing = len(set(BDFS) - {e[0] for e in live})
+        needs_restart = (state == 'running' and missing > 0 and
+                         (h.hotplug_capacity(live_root) < missing or not h.agent_channel(live_root)))
+        driver_ready = (guest_driver_ready(ident) if check_drivers and state == 'running' and
+                        {e[0] for e in live if e[0] in BDFS} == set(BDFS) else None)
+        result.append({'uuid': ident, 'name': root.findtext('name'), 'state': state, 'driver_ready': driver_ready,
+                       'optional': bool(optional), 'prepared': prepared, 'persistent': persistent,
+                       'startup_gpu': any(bdf in BDFS for bdf, _ in entries), 'pci': bool(entries or optional),
+                       'eligible': supported, 'needs_restart': needs_restart,
                        'live_gpu': [e[0] for e in live if e[0] in BDFS]})
     return result
 
@@ -509,33 +673,36 @@ def destination_rows(records):
             ('cuda', 'CUDA without Xorg', 'Compute', 'NVIDIA + UVM for CUDA; desktop stays on the primary GPU', True),
             ('xorg', 'Xorg', 'Host gaming', 'NVIDIA PRIME; desktop stays on the primary GPU', True)]
     states = {'running': 'running', 'shut off': 'shut off', 'paused': 'paused', 'in shutdown': 'shutting down'}
-    for d in records:
-        if d['pci']:
-            info = states.get(d['state'], d['state'])
-            live_gpu = set(d['live_gpu'])
-            if live_gpu == set(BDFS):
-                info += ' · GPU attached'
-            elif live_gpu:
-                info += f' · GPU partial ({len(live_gpu)}/{len(BDFS)})'
-            else:
-                info += ' · no GPU'
-            if not d['eligible']:
-                info += '; not configured for the selected GPU'
-            rows.append((d['uuid'], d['name'], 'Virtual machine', info, d['eligible']))
+    for d in sorted(records, key=lambda d: (not d.get('prepared', d.get('optional', False)), d['name'].casefold())):
+        info = states.get(d['state'], d['state'])
+        live_gpu = set(d['live_gpu'])
+        if live_gpu == set(BDFS):
+            info += ' · GPU attached'
+        elif live_gpu:
+            info += f' · GPU partial ({len(live_gpu)}/{len(BDFS)})'
+        else:
+            info += ' · no GPU'
+        if d.get('driver_ready') is False:
+            info += '; Debian driver setup needs checking'
+        if not d['eligible']:
+            info += '; automatic setup requires a persistent x86_64 q35/i440fx VM'
+        elif not d.get('prepared', d.get('optional', False)):
+            info += '; Connect will prepare this VM (Debian)'
+        if d.get('needs_restart'):
+            info += '; shutdown/start needed for PCI ports or guest-agent channel'
+        rows.append((d['uuid'], d['name'], 'Virtual machine', info, d['eligible']))
     return rows
 
 
 def operation_plan(target, records, xorg_attached):
     selected = next((d for d in records if d['uuid'] == target), None)
     if target not in ('none', 'xorg', 'cuda') and (selected is None or not selected['eligible']):
-        raise Error('The selected VM must have all PCI functions of the selected NVIDIA GPU configured.')
-    if selected and selected['state'] == 'shut off' and not selected.get('optional'):
-        raise Error('Enable optional GPU setup for this VM before a one-time GPU boot.')
+        raise Error('Automatic setup requires a persistent x86_64 QEMU/KVM q35 or i440fx VM.')
     owners = [d for d in records if d['live_gpu']]
     if selected and selected['live_gpu'] and set(selected['live_gpu']) == set(BDFS):
         return [], False
-    stops = [d for d in owners if not (selected and d['uuid'] == target and selected.get('optional'))]
-    if selected and selected['state'] != 'shut off' and selected not in stops and not (selected.get('optional') and selected['state'] == 'running'):
+    stops = [d for d in owners if not (selected and d['uuid'] == target and not selected.get('needs_restart'))]
+    if selected and selected['state'] != 'shut off' and selected not in stops and not (not selected.get('needs_restart') and selected['state'] == 'running'):
         stops.append(selected)
     if any(d['state'] != 'running' for d in stops):
         raise Error('First shut down the paused or transitioning GPU-owning VM manually.')
@@ -550,7 +717,7 @@ def operation_status(h, job, state, message, target):
                              'target': target, 'gpu': GPU, 'time': time.time()}, mode=0o644)
 
 
-def selection_worker(target, job, shutdown, restart):
+def selection_worker(target, job, shutdown, restart, prepare_vm=False):
     if os.geteuid() != 0:
         raise Error('Administrator authentication required')
     h = load_hook()
@@ -564,19 +731,29 @@ def selection_worker(target, job, shutdown, restart):
         attached = bool(xorg_owners(h))
         stops, needs_restart = operation_plan(target, records, attached)
         selected = next((d for d in records if d['uuid'] == target), None)
+        if selected and not selected.get('optional') and not prepare_vm:
+            raise Error('Use Connect or select --prepare-vm to authorize automatic Debian VM setup.')
+        if prepare_vm and selected and selected['state'] == 'running' and not selected.get('needs_restart'):
+            debian_guest(target)
         if stops and not shutdown:
             raise Error('Switching requires permission to shut down the current VM gracefully.')
         if needs_restart and not restart:
             raise Error('Switching requires permission to end graphical sessions.')
-        fd = h.lock()
-        try:
-            h.topology()
-            if selected and set(selected['live_gpu']) == set(BDFS):
+        if selected and set(selected['live_gpu']) == set(BDFS):
+            fd = h.lock()
+            try:
+                h.topology()
                 if any(h.driver(b) != 'vfio-pci' for b in BDFS):
                     raise Error('VM reports the GPU, but VFIO bindings do not match.')
                 h.choose_target(target)
-                operation_status(h, job, 'done', 'GPU is already attached to ' + selected['name'], target)
-                return
+            finally:
+                os.close(fd)
+            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            operation_status(h, job, 'done', 'GPU is already attached to ' + selected['name'] + ('. ' + detail if detail else ''), target)
+            return
+        fd = h.lock()
+        try:
+            h.topology()
             h.choose_target('blocked')  # No new guest may claim the GPU during a switch.
         finally:
             os.close(fd)
@@ -588,7 +765,16 @@ def selection_worker(target, job, shutdown, restart):
                 if time.monotonic() >= deadline:
                     raise Error('VM did not shut down within 120 seconds. No forced shutdown was performed.')
                 time.sleep(1)
-        if any(d['live_gpu'] for d in inventory()):
+        if prepare_vm and selected:
+            operation_status(h, job, 'running', 'Preparing the selected VM definition…', target)
+            prepare_vm_definition(target)
+        owners = [d for d in inventory() if d['live_gpu']]
+        if owners and all(d['uuid'] == target for d in owners):
+            attach_running(target)
+            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            operation_status(h, job, 'done', 'GPU attachment completed. ' + detail, target)
+            return
+        if owners:
             raise Error('A VM owns the GPU again; switching has stopped.')
         now_attached = bool(xorg_owners(h))
         wanted_mode = 'on' if target == 'xorg' else 'off'
@@ -623,7 +809,8 @@ def selection_worker(target, job, shutdown, restart):
         current = next((d for d in inventory() if d['uuid'] == target), None)
         if current and current.get('optional') and current['state'] == 'running':
             attach_running(target)
-            operation_status(h, job, 'done', 'GPU attached to running VM ' + current['name'], target)
+            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            operation_status(h, job, 'done', 'GPU attached to running VM ' + current['name'] + ('. ' + detail if detail else ''), target)
             return
         fd = h.lock()
         try:
@@ -644,7 +831,11 @@ def selection_worker(target, job, shutdown, restart):
                 attach_running(target)
             else:
                 start_optional(target)
-            message = 'GPU attached to VM ' + current['name']
+            actual = next(d for d in inventory() if d['uuid'] == target)
+            if set(actual['live_gpu']) != set(BDFS):
+                raise Error('VM started without the GPU because it could not be claimed safely; no guest packages were changed.')
+            detail = setup_guest_driver(target, job, target) if prepare_vm else ''
+            message = 'GPU attached to VM ' + current['name'] + ('. ' + detail if detail else '')
         else:
             message = 'GPU is idle, without a VM or Xorg attachment.'
         operation_status(h, job, 'done', message, target)
@@ -653,7 +844,7 @@ def selection_worker(target, job, shutdown, restart):
         raise
 
 
-def select_destination(target, job, shutdown, restart):
+def select_destination(target, job, shutdown, restart, prepare_vm=False):
     if target not in ('none', 'xorg', 'cuda') and str(uuid.UUID(target)) != target:
         raise Error('Invalid target UUID')
     if str(uuid.UUID(job)) != job:
@@ -666,6 +857,8 @@ def select_destination(target, job, shutdown, restart):
         raise Error('Install the GUI handoff update first.')
     ensure_integration(vm=target not in ('none', 'xorg', 'cuda'))
     args = program_command('--selection-worker', target, '--job-id', job)
+    if prepare_vm:
+        args.append('--prepare-vm')
     caller = os.environ.get('PKEXEC_UID')
     if caller:
         status_file(int(caller), job)
@@ -840,7 +1033,7 @@ class GPUWindow:
         self.last_refresh = time.monotonic()
         def fetch():
             try:
-                records = inventory()
+                records = inventory(check_drivers=True)
                 attached = pci_driver(GPU) == 'nvidia' and not load_hook().shared_nvidia_driver() and bool(nvidia_provider(providers()))
                 self.messages.put(('inventory', records, attached, pci_driver(GPU)))
             except Exception as exc:
@@ -865,7 +1058,7 @@ class GPUWindow:
             self.current.set('Current attachment: ' + ('none — idle GPU on VFIO' if driver == 'vfio-pci' else 'host; not attached to Xorg'))
             current = 'none'
         self.current_target = current
-        if owners and set(owners[0]['live_gpu']) != set(BDFS):
+        if owners and (set(owners[0]['live_gpu']) != set(BDFS) or owners[0].get('driver_ready') is False):
             self.current_target = None
         elif current == 'none' and driver not in ('vfio-pci', 'unbound'):
             self.current_target = None
@@ -908,7 +1101,12 @@ class GPUWindow:
             messagebox.showerror('Cannot switch GPU', str(exc), parent=self.root)
             return
         label = self.rows[target][1]
+        vm_target = target not in ('none', 'xorg', 'cuda')
         changes = ['Attach GPU to: ' + label + '.']
+        if vm_target:
+            changes.append('Prepare missing GPU templates, PCI controllers and guest-agent channel in the selected VM definition. Ordinary starts remain GPU-free.')
+            changes.append('Use the existing QEMU guest agent to verify Debian 12/13 and install missing NVIDIA drivers. If needed, add NVIDIA’s signed APT repository and reboot this guest once. This accepts the NVIDIA driver license.')
+            changes.append('Guest package changes affect /etc/apt, /usr, /lib, /boot and /var (APT, dpkg and DKMS); the VM definition is saved by libvirt under /etc/libvirt/qemu. Host integration may use /etc/libvirt/hooks/qemu.d, /etc/X11/xorg.conf.d and /etc/wireplumber, and /run for handoff safety state.')
         if stops:
             changes.append('VMs to shut down gracefully: ' + ', '.join(d['name'] for d in stops) + '.')
         if restart:
@@ -919,6 +1117,8 @@ class GPUWindow:
             return
         self.job = str(uuid.uuid4())
         args = ['/usr/bin/pkexec', '--disable-internal-agent', *program_command('select', target, '--job-id', self.job)]
+        if vm_target:
+            args.append('--prepare-vm')
         if stops:
             args.append('--shutdown-owner')
         if restart:
@@ -1576,6 +1776,7 @@ def main(argv):
         parser.add_argument('--status-uid', type=int)
         parser.add_argument('--shutdown-owner', action='store_true')
         parser.add_argument('--restart-session', action='store_true')
+        parser.add_argument('--prepare-vm', action='store_true', help='Authorize VM hardware setup, Debian driver packages and one guest reboot if required')
         # Internal worker uses an option-shaped token; remove it before argparse.
         args = parser.parse_args((['worker'] + argv[1:]) if argv[0] == '--selection-worker' else argv)
         job = args.job_id or str(uuid.uuid4())
@@ -1585,7 +1786,7 @@ def main(argv):
                 raise Error('Internal progress option requires root worker')
             OP_STATUS = status_file(args.status_uid, job)
         fn = selection_worker if args.mode == 'worker' else select_destination
-        return fn(args.target, job, args.shutdown_owner, args.restart_session)
+        return fn(args.target, job, args.shutdown_owner, args.restart_session, args.prepare_vm)
     if len(argv) == 2 and argv[0] == '--worker' and argv[1] in ('connect', 'disconnect'):
         return worker(argv[1])
     if argv[:1] == ['run']:

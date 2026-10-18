@@ -398,6 +398,286 @@ class StatelessTests(unittest.TestCase):
         self.app.restore_host.assert_not_called()
 
 
+    def guest_xml(self, machine='pc-q35-9.2'):
+        return ('<domain type="kvm"><name>example</name><os><type arch="x86_64" machine="' +
+                machine + '">hvm</type></os><devices><controller type="pci" index="0" model="' +
+                ('pcie-root' if 'q35' in machine else 'pci-root') + '"/></devices></domain>')
+
+    def configure_guest_devices(self):
+        self.core.GPU = self.gpu
+        self.core.DEVICES = (self.gpu, self.gpu[:-1]+'1')
+        self.app.BDFS = self.core.DEVICES
+
+    def test_unprepared_vm_gets_complete_optional_templates_and_ports(self):
+        self.configure_guest_devices()
+        root = self.app.ET.fromstring(self.core.prepare_guest_xml(self.guest_xml()))
+        self.assertEqual(len(self.core.optional_devices(root)), 2)
+        self.assertEqual(root.findall('./devices/hostdev'), [])
+        self.assertTrue(self.core.agent_channel(root))
+        self.assertGreaterEqual(self.core.hotplug_capacity(root), 3)
+        self.assertEqual(self.core.prepare_guest_xml(self.app.ET.tostring(root, encoding='unicode')),
+                         self.app.ET.tostring(root, encoding='unicode'))
+
+    def test_partial_manual_configuration_is_completed(self):
+        self.configure_guest_devices()
+        root = self.app.ET.fromstring(self.guest_xml())
+        hostdev = self.app.ET.SubElement(root.find('devices'), 'hostdev', {'type':'pci','managed':'no'})
+        source = self.app.ET.SubElement(hostdev, 'source')
+        self.app.ET.SubElement(source, 'address', {'domain':'0x0000','bus':'0x02','slot':'0x00','function':'0x0'})
+        changed = self.core.prepare_guest_xml(self.app.ET.tostring(root, encoding='unicode'))
+        self.assertEqual(len(self.core.optional_devices(self.app.ET.fromstring(changed))), 2)
+
+    def test_preparation_preserves_unrelated_vm_devices_and_metadata(self):
+        self.configure_guest_devices()
+        root = self.app.ET.fromstring(self.guest_xml())
+        self.app.ET.SubElement(root.find('devices'), 'disk', {'type':'file'})
+        meta = self.app.ET.SubElement(root,'metadata')
+        self.app.ET.SubElement(meta,'{urn:user}note').text = 'keep'
+        changed = self.core.prepare_guest_xml(self.app.ET.tostring(root, encoding='unicode'))
+        result = self.app.ET.fromstring(changed)
+        self.assertIsNotNone(result.find('./devices/disk'))
+        self.assertEqual(result.findtext('./metadata/{urn:user}note'), 'keep')
+
+    def test_unprepared_i440fx_uses_existing_pci_bus(self):
+        self.configure_guest_devices()
+        root = self.app.ET.fromstring(self.core.prepare_guest_xml(self.guest_xml('pc-i440fx-9.2')))
+        self.assertFalse(root.findall('./devices/controller[@model="pcie-root-port"]'))
+        self.assertEqual(len(self.core.optional_devices(root)), 2)
+
+    def test_unsupported_architecture_refuses_preparation(self):
+        self.configure_guest_devices()
+        xml = self.guest_xml().replace('x86_64','aarch64')
+        with self.assertRaises(self.core.Refuse):
+            self.core.prepare_guest_xml(xml)
+
+    def test_cleanup_removes_only_unused_owned_preparation_devices(self):
+        self.configure_guest_devices()
+        changed = self.core.prepare_guest_xml(self.guest_xml())
+        result = self.app.ET.fromstring(self.core.disable_optional_xml(changed))
+        self.assertFalse(self.core.agent_channel(result))
+        self.assertEqual(len(result.findall('./devices/controller')), 1)
+        root = self.app.ET.fromstring(changed)
+        disk = self.app.ET.SubElement(root.find('devices'),'disk')
+        self.app.ET.SubElement(disk,'address',{'type':'pci','bus':'0x01','slot':'0x0','function':'0x0'})
+        result = self.app.ET.fromstring(self.core.disable_optional_xml(self.app.ET.tostring(root,encoding='unicode')))
+        self.assertIsNotNone(result.find('./devices/controller[@index="1"]'))
+
+    def test_rows_include_unprepared_and_rank_prepared_first(self):
+        self.configure_guest_devices()
+        def record(name, prepared):
+            return dict(uuid=name,name=name,state='shut off',pci=False,optional=prepared,
+                        prepared=prepared,eligible=True,live_gpu=[])
+        rows=self.app.destination_rows([record('Alpha',False),record('Zeta',True),record('Beta',False)])
+        self.assertEqual([row[0] for row in rows[3:]], ['Zeta','Alpha','Beta'])
+        self.assertTrue(all(row[4] for row in rows))
+
+    def test_operation_plan_requires_shutdown_only_for_missing_live_capacity(self):
+        self.configure_guest_devices()
+        d=dict(uuid='vm',name='vm',state='running',eligible=True,optional=False,live_gpu=[],needs_restart=False)
+        self.assertEqual(self.app.operation_plan('vm',[d],False),([],False))
+        d['needs_restart']=True
+        self.assertEqual(self.app.operation_plan('vm',[d],False),([d],False))
+
+    def test_debian_detection_rejects_other_os_without_guest_exec(self):
+        self.app.guest_agent=Mock(return_value={'id':'ubuntu','version-id':'24.04','pretty-name':'Ubuntu'})
+        self.app.guest_exec=Mock(side_effect=AssertionError('must not execute'))
+        with self.assertRaises(self.app.Error):
+            self.app.debian_guest('vm')
+        self.app.guest_exec.assert_not_called()
+
+    def test_debian_detection_accepts_supported_guest(self):
+        self.app.guest_agent=Mock(return_value={'id':'debian','version-id':'13','pretty-name':'Debian'})
+        self.app.guest_exec=Mock(return_value=(0,'amd64\n'))
+        self.assertEqual(self.app.debian_guest('vm'),'13')
+
+    def test_missing_agent_has_actionable_error(self):
+        self.app.guest_agent=Mock(side_effect=self.app.Error('offline'))
+        with self.assertRaisesRegex(self.app.Error,'qemu-guest-agent'):
+            self.app.debian_guest('vm')
+
+    def test_guest_exec_decodes_result_without_running_a_command(self):
+        self.app.guest_agent=Mock(side_effect=[{'pid':42},{'exited':True,'exitcode':0,
+            'out-data':'aGVsbG8K'}])
+        self.assertEqual(self.app.guest_exec('vm','/bin/test'),(0,'hello\n'))
+        self.assertEqual(self.app.guest_agent.call_args_list[-1].args[1],'guest-exec-status')
+
+    def test_driver_recommendation_rejects_shell_and_options(self):
+        self.assertEqual(self.app.recommended_driver_packages('sudo apt install -y nvidia-open'),['nvidia-open'])
+        for text in ('sudo apt install nvidia-open; reboot','sudo apt install --allow-remove-essential nvidia-open','curl bad | sh'):
+            with self.subTest(text=text), self.assertRaises(self.app.Error):
+                self.app.recommended_driver_packages(text)
+
+    def test_ready_guest_skips_all_package_changes(self):
+        self.app.load_hook=Mock()
+        self.app.debian_guest=Mock(return_value='13')
+        self.app.guest_driver_ready=Mock(return_value=True)
+        self.app.guest_exec=Mock(side_effect=AssertionError('no packages needed'))
+        self.assertIn('ready', self.app.setup_guest_driver('vm','job','vm'))
+        self.app.guest_exec.assert_not_called()
+
+    def test_failed_package_bootstrap_keeps_gpu_and_does_not_reboot(self):
+        self.app.load_hook=Mock()
+        self.app.operation_status=Mock()
+        self.app.debian_guest=Mock(return_value='13')
+        self.app.guest_driver_ready=Mock(return_value=False)
+        self.app.guest_exec=Mock(return_value=(1,'no network'))
+        self.app.virsh=Mock(side_effect=AssertionError('must not reboot or unplug'))
+        with self.assertRaisesRegex(self.app.Error,'GPU remains attached'):
+            self.app.setup_guest_driver('vm','job','vm')
+        self.app.virsh.assert_not_called()
+
+    def test_driver_packages_are_simulated_and_cannot_remove_packages(self):
+        self.app.load_hook=Mock()
+        self.app.operation_status=Mock()
+        self.app.debian_guest=Mock(return_value='13')
+        self.app.guest_driver_ready=Mock(side_effect=[False,True])
+        self.app.guest_exec=Mock(side_effect=[(0,''),(0,'sudo apt install -y nvidia-open'),(0,''),(0,'')])
+        self.assertIn('ready',self.app.setup_guest_driver('vm','job','vm'))
+        install=self.app.guest_exec.call_args_list[2:]
+        self.assertIn('--simulate',install[0].args[2])
+        self.assertTrue(all('--no-remove' in call.args[2] for call in install))
+
+
+    def test_preparation_defines_only_inactive_xml_and_rechecks_edits(self):
+        self.configure_guest_devices()
+        self.app.load_hook=lambda:self.core
+        xml=self.guest_xml()
+        self.app.virsh=Mock(side_effect=['Persistent: yes',xml,xml])
+        self.app.virsh_input=Mock()
+        self.app.prepare_vm_definition('vm')
+        self.assertEqual(self.app.virsh_input.call_args.args[1:],('define','/dev/stdin','--validate'))
+        self.app.virsh=Mock(side_effect=['Persistent: yes',xml,xml.replace('example','edited')])
+        self.app.virsh_input.reset_mock()
+        with self.assertRaisesRegex(self.app.Error,'changed during preparation'):
+            self.app.prepare_vm_definition('vm')
+        self.app.virsh_input.assert_not_called()
+
+    def test_new_vm_pipeline_prepares_before_boot_then_installs_driver(self):
+        self.configure_guest_devices()
+        d=dict(uuid='vm',name='vm',state='shut off',eligible=True,optional=False,live_gpu=[])
+        self.app.inventory=lambda:[d]
+        self.app.xorg_owners=lambda h:set()
+        self.app.operation_status=Mock()
+        self.app.worker=Mock()
+        h=Mock()
+        h.assert_x11=Mock()
+        h.xorg_mode.return_value='off'
+        h.load.return_value=None
+        locked=[False]
+        def acquire():
+            self.assertFalse(locked[0])
+            locked[0]=True
+            return os.open(self.root/'lock',os.O_CREAT|os.O_RDWR,0o600)
+        close=os.close
+        def release(fd):
+            locked[0]=False
+            close(fd)
+        h.lock=acquire
+        self.app.load_hook=lambda:h
+        events=[]
+        def prepare(ident):
+            self.assertFalse(locked[0])
+            events.append('prepare')
+            d['optional']=True
+        def start(ident):
+            self.assertFalse(locked[0])
+            events.append('start')
+            d.update(state='running',live_gpu=list(self.app.BDFS))
+        def driver(*args):
+            self.assertFalse(locked[0])
+            events.append('driver')
+            return 'ready'
+        self.app.prepare_vm_definition=prepare
+        self.app.start_optional=start
+        self.app.setup_guest_driver=driver
+        with patch.object(os,'geteuid',return_value=0),patch.object(os,'close',release):
+            self.app.selection_worker('vm','job',False,False,True)
+        self.assertEqual(events,['prepare','start','driver'])
+
+    def test_guest_exec_timeout_reports_pid_without_killing_process(self):
+        self.app.guest_agent=Mock(side_effect=[{'pid':42},{'exited':False}])
+        with patch.object(self.app.time,'monotonic',side_effect=[0,2]), \
+             self.assertRaisesRegex(self.app.Error,'process 42 may still be running'):
+            self.app.guest_exec('vm','/bin/test',timeout=1)
+        self.assertEqual(self.app.guest_agent.call_count,2)
+
+    def test_guest_driver_readiness_matches_selected_device(self):
+        self.app.GPU=self.gpu
+        self.app.SETTINGS={'devices':[{'bdf':self.gpu,'device':'0x2d04'}]}
+        self.app.guest_exec=Mock(return_value=(0,'0x2D0410DE\n'))
+        self.assertTrue(self.app.guest_driver_ready('vm'))
+        self.app.guest_exec=Mock(return_value=(0,'0x123410DE\n'))
+        self.assertFalse(self.app.guest_driver_ready('vm'))
+
+    def test_package_failure_never_requests_reboot(self):
+        self.app.load_hook=Mock()
+        self.app.operation_status=Mock()
+        self.app.debian_guest=Mock(return_value='13')
+        self.app.guest_driver_ready=Mock(return_value=False)
+        self.app.guest_exec=Mock(side_effect=[(0,''),(0,'sudo apt install -y nvidia-open'),(1,'removal required')])
+        self.app.virsh=Mock(side_effect=AssertionError('must not reboot'))
+        with self.assertRaisesRegex(self.app.Error,'package operation failed'):
+            self.app.setup_guest_driver('vm','job','vm')
+        self.app.virsh.assert_not_called()
+
+    def test_driver_setup_reboots_once_only_after_confirmed_install(self):
+        self.app.load_hook=Mock()
+        self.app.operation_status=Mock()
+        self.app.debian_guest=Mock(return_value='13')
+        self.app.guest_driver_ready=Mock(side_effect=[False,False,True])
+        old='11111111-1111-1111-1111-111111111111\n'
+        new='22222222-2222-2222-2222-222222222222\n'
+        self.app.guest_exec=Mock(side_effect=[(0,''),(0,'sudo apt install -y nvidia-open'),(0,''),(0,''),(0,old),(0,new)])
+        self.app.virsh=Mock()
+        with patch.object(self.app.time,'sleep'):
+            self.assertIn('after guest reboot',self.app.setup_guest_driver('vm','job','vm'))
+        self.app.virsh.assert_called_once_with('reboot','vm','--mode','agent')
+
+
+    def test_connected_guest_can_retry_driver_setup_without_gpu_switch(self):
+        self.configure_guest_devices()
+        d=dict(uuid='vm',name='vm',state='running',eligible=True,optional=True,live_gpu=list(self.app.BDFS))
+        self.app.inventory=lambda:[d]
+        self.app.xorg_owners=lambda h:set()
+        self.app.debian_guest=Mock(return_value='13')
+        self.app.operation_status=Mock()
+        self.app.worker=Mock(side_effect=AssertionError('must not switch host mode'))
+        h=Mock()
+        h.assert_x11=Mock()
+        h.driver.return_value='vfio-pci'
+        self.app.load_hook=lambda:h
+        locked=[False]
+        def acquire():
+            locked[0]=True
+            return os.open(self.root/'lock',os.O_CREAT|os.O_RDWR,0o600)
+        close=os.close
+        def release(fd):
+            locked[0]=False
+            close(fd)
+        h.lock=acquire
+        def driver(*args):
+            self.assertFalse(locked[0])
+            return 'ready'
+        self.app.setup_guest_driver=Mock(side_effect=driver)
+        with patch.object(os,'geteuid',return_value=0),patch.object(os,'close',release):
+            self.app.selection_worker('vm','job',False,False,True)
+        self.app.setup_guest_driver.assert_called_once()
+        self.app.worker.assert_not_called()
+
+    def test_current_target_guard_accounts_for_live_guest_driver_readiness(self):
+        self.configure_guest_devices()
+        d=dict(uuid='vm',name='vm',state='running',eligible=True,prepared=True,
+               optional=True,pci=True,live_gpu=list(self.app.BDFS),driver_ready=False)
+        window=types.SimpleNamespace(current=Mock(),tree=Mock(),update_button=Mock())
+        window.tree.selection.return_value=('vm',)
+        window.tree.get_children.return_value=()
+        self.app.GPUWindow.show_inventory(window,[d],False,'vfio-pci')
+        self.assertIsNone(window.current_target)
+        d['driver_ready']=True
+        self.app.GPUWindow.show_inventory(window,[d],False,'vfio-pci')
+        self.assertEqual(window.current_target,'vm')
+
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

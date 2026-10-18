@@ -588,6 +588,81 @@ def enable_optional_xml(xml):
     return ET.tostring(root, encoding='unicode')
 
 
+def guest_supported(root):
+    os_type = root.find('./os/type')
+    machine = os_type.get('machine', '') if os_type is not None else ''
+    return (root.get('type') in ('kvm', 'qemu') and os_type is not None and
+            os_type.text == 'hvm' and os_type.get('arch') == 'x86_64' and
+            ('q35' in machine or machine == 'pc' or machine.startswith('pc-i440fx-')))
+
+
+def agent_channel(root):
+    return root.find('./devices/channel/target[@name="org.qemu.guest_agent.0"]') is not None
+
+
+def hotplug_capacity(root):
+    devices = root.find('devices')
+    occupied = {int(a.get('bus', '0'), 0) for a in devices.findall('./*/address[@type="pci"]')}
+    controllers = devices.findall('controller[@type="pci"]')
+    if any(c.get('model') == 'pcie-root' for c in controllers):
+        return sum(c.get('model') == 'pcie-root-port' and
+                   c.find('./target[@hotplug="off"]') is None and int(c.get('index', '0')) not in occupied
+                   for c in controllers)
+    used = {int(a.get('slot', '0'), 0) for a in devices.findall('./*/address[@type="pci"]')
+            if int(a.get('bus', '0'), 0) == 0}
+    return 31 - len(used - {0})
+
+
+def prepare_guest_xml(xml):
+    """Prepare one persistent guest; no guest or driver operations here."""
+    root = ET.fromstring(xml)
+    if not guest_supported(root):
+        raise Refuse('Automatic preparation supports persistent x86_64 QEMU/KVM q35 or i440fx guests')
+    devices = root.find('devices')
+    if not optional_devices(root):
+        present = set()
+        for dev in devices.findall('hostdev[@type="pci"]'):
+            address = dev.find('./source/address')
+            if address is not None:
+                present.add('%04x:%02x:%02x.%x' % tuple(int(address.get(k, '0'), 0)
+                            for k in ('domain', 'bus', 'slot', 'function')))
+        for bdf in DEVICES:
+            if bdf in present:
+                continue
+            dev = ET.SubElement(devices, 'hostdev', {'mode': 'subsystem', 'type': 'pci', 'managed': 'no'})
+            source = ET.SubElement(dev, 'source')
+            domain, bus, rest = bdf.split(':')
+            slot, function = rest.split('.')
+            ET.SubElement(source, 'address', dict(domain='0x'+domain, bus='0x'+bus,
+                                                   slot='0x'+slot, function='0x'+function))
+        root = ET.fromstring(enable_optional_xml(ET.tostring(root, encoding='unicode')))
+        devices = root.find('devices')
+    token = GPU.replace(':', '_').replace('.', '_')
+    extra = 0
+    if not agent_channel(root):
+        channel = ET.SubElement(devices, 'channel', {'type': 'unix'})
+        ET.SubElement(channel, 'target', {'type': 'virtio', 'name': 'org.qemu.guest_agent.0'})
+        ET.SubElement(channel, 'alias', {'name': 'ua-nvidia-handoff-agent-' + token})
+        if devices.find('controller[@type="virtio-serial"]') is None:
+            serial = ET.SubElement(devices, 'controller', {'type': 'virtio-serial', 'index': '0'})
+            ET.SubElement(serial, 'alias', {'name': 'ua-nvidia-handoff-serial-' + token})
+            extra = 1
+    if 'q35' in root.find('./os/type').get('machine', ''):
+        if devices.find('controller[@type="pci"][@model="pcie-root"]') is None:
+            ET.SubElement(devices, 'controller', {'type': 'pci', 'index': '0', 'model': 'pcie-root'})
+        indices = {int(c.get('index', '0')) for c in devices.findall('controller[@type="pci"]')}
+        needed = max(0, len(DEVICES) + extra - hotplug_capacity(root))
+        for _ in range(needed):
+            index = next((i for i in range(1, 256) if i not in indices), None)
+            if index is None:
+                raise Refuse('No PCI controller indices remain')
+            indices.add(index)
+            port = ET.SubElement(devices, 'controller', {'type': 'pci', 'index': str(index), 'model': 'pcie-root-port'})
+            ET.SubElement(port, 'alias', {'name': 'ua-nvidia-handoff-port-' + token + '-' + str(index)})
+    optional_devices(root)
+    return ET.tostring(root, encoding='unicode')
+
+
 def disable_optional_xml(xml):
     """Remove our metadata; keep GPU-free defaults and all later user edits."""
     root = ET.fromstring(xml)
@@ -596,6 +671,28 @@ def disable_optional_xml(xml):
         return None
     meta = root.find('metadata')
     meta.remove(meta.find('{' + OPTIONAL_NS + '}gpu'))
+    token = GPU.replace(':', '_').replace('.', '_')
+    devices = root.find('devices')
+    for dev in list(devices):
+        alias = dev.find('alias')
+        if alias is not None and alias.get('name') == 'ua-nvidia-handoff-agent-' + token:
+            devices.remove(dev)
+    for dev in reversed(list(devices)):
+        alias = dev.find('alias')
+        name = alias.get('name', '') if alias is not None else ''
+        owned = name.startswith('ua-nvidia-handoff-port-' + token + '-') or name == 'ua-nvidia-handoff-serial-' + token
+        if not owned:
+            continue
+        index = int(dev.get('index', '0'))
+        if dev.get('type') == 'pci':
+            used = any(int(a.get('bus', '0'), 0) == index for other in devices if other is not dev
+                       for a in other.findall('address[@type="pci"]'))
+        else:
+            used = any(int(a.get('controller', '0')) == index for other in devices if other is not dev
+                       for a in other.findall('address[@type="virtio-serial"]'))
+        if not used:
+            devices.remove(dev)
+
     if not len(meta) and not meta.attrib:
         root.remove(meta)
     return ET.tostring(root, encoding='unicode')
