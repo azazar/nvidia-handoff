@@ -1,111 +1,107 @@
 # NVIDIA handoff
 
-Safely share one displayless secondary NVIDIA GPU between host compute, host gaming, and libvirt virtual machines. The primary GPU continues to run the desktop.
+Share a displayless secondary NVIDIA GPU between CUDA applications, host games, and libvirt virtual machines. The primary GPU runs the desktop.
 
-## Requirements and scope
+## Features
 
-- Debian with systemd/logind and an installed proprietary NVIDIA driver, including UVM for CUDA.
-- An X11 desktop and X11 login screen. X.Org and XLibre use the same X11 path; Wayland and Xwayland sessions are refused. XLibre still needs a compatible NVIDIA driver.
-- A secondary, non-boot NVIDIA GPU with no connected display. Device discovery includes its NVIDIA PCI functions, such as HDMI audio and USB controllers.
-- Isolated IOMMU groups for VM passthrough. Unrelated devices in the group are not detached.
-- System Python 3; Tkinter for the GUI; `lspci`, kmod tools, `udevadm`, and systemd tools. GUI GPU switching uses `pkexec` and a desktop authentication agent.
-- For VMs: libvirt's `virsh`, `qemu:///system`, and suitable guest PCIe topology. Hotplug also depends on the guest OS and NVIDIA driver.
+- **GPU destinations:** idle, CUDA without Xorg, Xorg with NVIDIA PRIME, or a virtual machine.
+- **Optional VM passthrough:** start a VM with or without the GPU; ordinary VM starts are GPU-free after setup.
+- **Live attachment:** connect the GPU and its associated PCI functions to a prepared running VM without restarting it.
+- **Per-run assignment:** a VM keeps the GPU until it powers off; its next ordinary start is GPU-free.
+- **Automatic discovery:** detect the secondary GPU, its PCI functions, IOMMU groups, VM definitions, and display manager.
+- **Desktop GUI:** view the current destination, VM state, and complete or partial attachments; supports desktop fonts and high DPI.
+- **Safety checks:** detect busy devices and active displays, roll back partial host detach, and retain recovery state after incomplete operations.
+- **Cleanup:** preview or remove the installed application and its integration from the GUI or CLI.
 
-The display manager is detected through systemd and the system X11 configuration; it is not tied to XFCE or a particular login manager. There is one selected GPU per installation. Support for arbitrary Debian, GPU, and guest combinations is not a claim that all combinations have been tested.
+## Requirements
 
-## Files
+- Debian with systemd/logind, system Python 3, and the proprietary NVIDIA driver. CUDA mode requires NVIDIA UVM.
+- A secondary, non-boot NVIDIA GPU with no connected display, plus a separate primary GPU for the desktop.
+- An X11 desktop and login screen. X.Org and XLibre are supported with compatible NVIDIA drivers; Wayland and Xwayland are unsupported.
+- Tkinter for the GUI; `lspci`, kmod tools, `udevadm`, systemd tools, and `pkexec` with a desktop authentication agent.
+- For VM passthrough: libvirt, `virsh`, `qemu:///system`, isolated IOMMU groups, and suitable guest PCIe ports. Live attachment also requires guest OS and driver hotplug support.
 
-| File | Purpose |
-| --- | --- |
-| `nvidia-handoff` | GUI, CLI, installer, optional VM startup, and cleanup |
-| `nvidia_handoff_core.py` | Shared busy checks, PCI driver transactions, rollback, and hook handling |
-| `AGENTS.md` | Rules for maintaining this project |
+Each installation manages one selected GPU and its associated NVIDIA PCI functions, including HDMI audio and any GPU USB controllers. The display manager is detected automatically, with an optional override. GPU and guest compatibility varies by configuration.
 
-Both program files are required and must stay together. The core module is not a backup or generated file. There are no third-party Python package requirements.
+## Installation
 
-## Inspect and install
+Keep `nvidia-handoff` and `nvidia_handoff_core.py` together in the source directory. They provide the GUI/CLI and shared GPU control logic respectively. No third-party Python packages are required.
 
-From the repository directory, inspect discovery and preview installation:
+Inspect hardware and preview installation:
 
 ```sh
 /usr/bin/python3 -I ./nvidia-handoff --probe
 sudo /usr/bin/python3 -I ./nvidia-handoff --install --dry-run
 ```
 
-If multiple GPUs qualify, use `--probe BDF` for discovery or `--gpu BDF` with `--install`; replace `BDF` with the selected PCI address. If login-manager detection needs an override, pass `--display-manager UNIT.service` during installation.
-
-Install after reviewing the system locations below:
+Install:
 
 ```sh
 sudo /usr/bin/python3 -I ./nvidia-handoff --install
 ```
 
-The base installation places the two program files in `/opt` and writes `/etc/nvidia-handoff.json`. It does not rebind a GPU, stop a VM, or restart the desktop. Integration files are created when the relevant setup or switching action needs them. Existing VM integration is retained on upgrades.
+The installer places both program files in `/opt` and writes `/etc/nvidia-handoff.json`. Installation preserves running VM hardware, GPU bindings, and graphical sessions. Use the installed copy for normal operation.
 
-Use the installed, root-owned copy for normal operation. The installer can read the user-owned source checkout; the installed application deliberately validates ownership and permissions before loading its core module and configuration.
-
-## Prepare optional VM passthrough
-
-Each intended VM must first have all selected GPU PCI functions configured in its **inactive** definition, with suitable PCIe ports. Then enable optional passthrough:
-
-```sh
-sudo /opt/nvidia-handoff enable-optional
-```
-
-This processes all persistent VMs whose definitions contain the selected GPU. It moves those device definitions into the VM's handoff metadata and removes the actual GPU host devices from persistent startup configuration. Running VM hardware remains unchanged. This is a one-time definition change, not something repeated before every boot.
-
-For a new installation, setup can also be requested with:
-
-```sh
-sudo /usr/bin/python3 -I ./nvidia-handoff --install --optional-gpu
-```
-
-PCIe ports must already exist before a guest starts if they are needed for later hotplug. See [libvirt PCI topology and hotplug](https://www.libvirt.org/pci-hotplug.html).
+For multiple eligible GPUs, use `--probe BDF` to inspect one and `--install --gpu BDF` to select it. Use `--display-manager UNIT.service` with `--install` to override display-manager detection.
 
 ## GUI
 
-Open from your normal X11 session, without sudo:
+Open from your normal X11 session:
 
 ```sh
 /opt/nvidia-handoff --gui
 ```
 
-Choose a destination:
-
-| Destination | Result |
+| Destination | Operation |
 | --- | --- |
 | None | Park the GPU idle, normally on VFIO when isolation permits |
-| CUDA without Xorg | Bind NVIDIA and load UVM without attaching the GPU to Xorg |
-| Xorg | Enable NVIDIA PRIME for host games; keep the desktop on the primary GPU |
-| A prepared VM | Start it with the GPU, or attach to an already running optional-GPU guest |
+| CUDA without Xorg | Bind NVIDIA and load UVM for compute |
+| Xorg | Enable NVIDIA PRIME for host games |
+| A prepared VM | Start it with the GPU or attach to the running guest |
 
-**Connect** is disabled when the selected destination is already active or an operation is in progress. A partial GPU attachment remains actionable. VM rows distinguish running with the GPU, running without it, and partial attachment.
+Select a destination and click **Connect**. The button is disabled for an already active destination or while an operation is in progress. Partial VM attachments can be completed through the same action.
 
-**Start without GPU** starts the selected shut-off VM without claiming the selected GPU or changing its drivers. It uses the user's libvirt permissions. **Refresh** updates ownership and VM state. **Full cleanup…** removes the installed application and its owned integration after confirmation and safety checks.
+**Start without GPU** starts a selected shut-off VM with GPU-free startup settings. **Refresh** updates ownership and VM status. **Full cleanup…** opens application removal.
 
-Switching into or out of Xorg GPU mode can restart the detected display manager and end graphical sessions. The GUI asks before that transition or before gracefully stopping a different GPU-owning VM. It does not forcibly shut down guests or unplug a GPU from a running guest.
+The GUI shows the current GPU destination and distinguishes VMs running with the GPU, without it, or with only some PCI functions attached. Xorg transitions and graceful shutdown of another GPU-owning VM require confirmation.
 
-## VM startup is temporary
+## VM setup
 
-Ordinary starts from virt-manager or `virsh start` use the persistent GPU-free definition. They do not try to take the GPU from Xorg, CUDA, or another VM.
-
-The script supplies a separate XML configuration for an explicit boot using `virsh create /dev/stdin --validate`. It does not add GPU devices to the persistent XML and then rewrite it after boot. No temporary VM XML file is needed, and there is no interval in which the next ordinary start is persistently configured to take the GPU.
+Configure all selected GPU PCI functions in each intended VM's inactive definition, with the PCIe ports needed for passthrough and hotplug. Enable optional GPU support:
 
 ```sh
-# Explicit one-time GPU boot; may fall back to no GPU when the safe claim is refused.
+sudo /opt/nvidia-handoff enable-optional
+```
+
+This configures all matching persistent VMs for GPU-free ordinary starts and records their GPU device templates. Running VM hardware remains unchanged.
+
+For a new installation, optional VM setup can be included in installation:
+
+```sh
+sudo /usr/bin/python3 -I ./nvidia-handoff --install --optional-gpu
+```
+
+PCIe ports needed for live attachment must exist before the guest starts. See [libvirt PCI topology and hotplug](https://www.libvirt.org/pci-hotplug.html).
+
+## Starting and connecting VMs
+
+```sh
+# Start with a one-time GPU assignment.
 sudo /opt/nvidia-handoff start-vm VM_NAME_OR_UUID
 
-# Boot without the selected GPU; requires libvirt write permission, not a driver switch.
+# Start without the selected GPU.
 /opt/nvidia-handoff start-vm VM_NAME_OR_UUID --without-gpu
 ```
 
-The GPU remains attached while that VM runs. After the VM powers off, its next ordinary start is GPU-free. A reboot inside the guest keeps the same running VM hardware; it is not a new GPU-free start.
+The GPU boot command can fall back to GPU-free startup when the GPU cannot be claimed safely. Starting without the GPU uses the caller's libvirt permissions and leaves GPU ownership unchanged.
 
-For a running prepared VM, **Connect** attaches the PCI functions with `attach-device --live`, without restarting the guest or changing persistent startup settings. Whether the NVIDIA driver initializes successfully after hotplug must be checked on the particular guest. See [libvirt attach-device](https://www.libvirt.org/manpages/virsh.html#attach-device).
+Ordinary starts from virt-manager or `virsh start` use the persistent GPU-free definition. An explicit GPU boot uses a configuration for that run only. The GPU remains connected until the VM powers off; a reboot inside the guest retains the same hardware.
 
-Saved-memory guests are not silently resumed with different hardware, and their saved memory is not automatically discarded. Resolve the managed save state explicitly in virt-manager before requesting a fresh boot. Names and UUIDs are both accepted; an existing UUID is not looked up again as a VM name.
+To attach to a running prepared VM, select it and click **Connect**. The attachment affects the running guest only. Successful NVIDIA driver initialization after hotplug depends on the guest configuration. See [libvirt attach-device](https://www.libvirt.org/manpages/virsh.html#attach-device).
 
-## Host commands
+Fresh boot requires any managed save state to be resumed or removed explicitly in virt-manager first. Both VM names and UUIDs are accepted.
+
+## Host gaming and status
 
 ```sh
 /opt/nvidia-handoff status
@@ -114,43 +110,39 @@ Saved-memory guests are not silently resumed with different hardware, and their 
 /opt/nvidia-handoff run -- YOUR_GAME_COMMAND
 ```
 
-`connect` and `disconnect` explicitly permit the display-manager restart and logout. Launch games as your normal user after signing in again.
+`connect` enables the Xorg gaming mode; `disconnect` returns Xorg to the primary GPU. These transitions restart the detected display manager and end graphical sessions. Save your work before using `--restart-session`, then sign in again and launch games as your normal user.
 
-## System footprint
+## Installed files
 
-| Location | When needed |
+| Location | Purpose |
 | --- | --- |
-| `/opt/nvidia-handoff`, `/opt/nvidia_handoff_core.py` | Installed program |
-| `/etc/nvidia-handoff.json` | Selected hardware, integration paths, and ownership records |
-| `/etc/libvirt/hooks/qemu.d/50-nvidia-handoff` | VM integration hook |
-| `/etc/X11/xorg.conf.d/90-nvidia-handoff.conf` | Xorg GPU policy when integration needs it |
-| `/etc/wireplumber/wireplumber.conf.d/51-nvidia-handoff-*.conf` | Selected HDMI audio exclusion on WirePlumber 0.5+ |
-| `/etc/wireplumber/main.lua.d/51-nvidia-handoff-*.lua` | Corresponding policy on WirePlumber 0.4.7+ |
-| `/run/nvidia-handoff/<BDF>/` | Private locking, recovery state, and destination policy after an actual operation |
-| `/run/user/<UID>/nvidia-handoff-<JOB_UUID>.json` | GUI operation progress; removed after completion is consumed |
+| `/opt/nvidia-handoff`, `/opt/nvidia_handoff_core.py` | Program files |
+| `/etc/nvidia-handoff.json` | Hardware selection and integration settings |
+| `/etc/libvirt/hooks/qemu.d/50-nvidia-handoff` | VM lifecycle integration |
+| `/etc/X11/xorg.conf.d/90-nvidia-handoff.conf` | Xorg GPU policy |
+| `/etc/wireplumber/wireplumber.conf.d/51-nvidia-handoff-*.conf` | Selected HDMI audio policy on WirePlumber 0.5+ |
+| `/etc/wireplumber/main.lua.d/51-nvidia-handoff-*.lua` | Selected HDMI audio policy on WirePlumber 0.4.7+ |
+| `/run/nvidia-handoff/<BDF>/` | Locking, recovery state, and destination policy |
+| `/run/user/<UID>/nvidia-handoff-<JOB_UUID>.json` | GUI operation progress |
 
-These are new-install defaults. Migrated installations retain paths recorded in their configuration. Merely opening or refreshing the GUI does not create runtime transaction files. There is no `/usr/local/bin` launcher, permanent handoff systemd unit, distribution-copy directory, or automatic archive/backup tree. Switching jobs use a transient systemd unit.
+Integration files are created for the relevant setup or switching action. These are default paths; migrated installations retain the paths in their configuration. GUI refresh and status inspection are read-only. Switching jobs run in a transient systemd unit.
 
-WirePlumber can hold a GPU's HDMI audio control device even when no sound is playing. The generated policy excludes only the selected displayless GPU's HDMI audio; it does not disable host audio globally. Apply a newly created policy by restarting WirePlumber in the affected desktop session or logging in again; restarting it can briefly interrupt sound.
+The WirePlumber policy excludes the selected displayless GPU's HDMI audio from host audio monitoring. Apply a new policy by logging in again or restarting WirePlumber in the affected session; the latter can briefly interrupt sound.
 
-Hooks never invoke libvirt commands, and workers do not hold the GPU lock across libvirt calls. Busy checks include open device descriptors and mappings. Partial host detach is rolled back. If only some functions reach a running VM, the program retains recovery state instead of forcibly unplugging them.
-
-## Cleanup and logs
-
-Preview removal before doing it:
+## Cleanup
 
 ```sh
 sudo /opt/nvidia-handoff --cleanup --dry-run
 sudo /opt/nvidia-handoff --cleanup
 ```
 
-The CLI asks for `REMOVE`; `--yes` is available for an explicitly confirmed noninteractive removal. Cleanup refuses while the GPU is owned by a VM, Xorg, or another workload, or a transition is active. It preserves administrator-modified integration files by refusing removal rather than overwriting or deleting them.
+The GUI provides the same operation through **Full cleanup…**. Interactive CLI removal asks for `REMOVE`; `--yes` confirms noninteractive removal.
 
-Successful cleanup restores safe host bindings and the original Xorg policy, removes owned integration files and runtime state, and removes handoff metadata while retaining GPU-free VM startup. It does not restore an old whole-VM XML over later user edits. The source checkout and system journal history remain. Log in again to restore HDMI audio monitoring after policy removal.
+Cleanup requires an idle GPU and no active transition. It restores host GPU bindings and the original Xorg policy, removes owned integration and runtime files, and leaves VM startup GPU-free. Administrator-modified integration files block removal for review. The source checkout and journal history remain. Log in again after cleanup to restore HDMI audio monitoring.
+
+## Logs
 
 ```sh
 sudo journalctl -t nvidia-handoff
 sudo journalctl -u nvidia-handoff.service
 ```
-
-Report the error, current destination, and whether a guest has a complete or partial attachment. Do not force-unbind, reset the PCI device, or erase retained recovery state to bypass a busy check.
