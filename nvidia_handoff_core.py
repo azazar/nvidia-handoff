@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Portable, configuration-driven NVIDIA handoff. No libvirt calls in hooks."""
+"""Stateless secondary NVIDIA handoff. No libvirt calls in hooks."""
 import base64
 import errno
 import fcntl
@@ -7,7 +7,6 @@ import json
 import os
 import re
 from pathlib import Path
-import signal
 import stat
 import struct
 import subprocess
@@ -19,9 +18,9 @@ import uuid
 import xml.etree.ElementTree as ET
 
 SETTINGS = {}
-VM = UUID = GPU = AUDIO = None
+VM = UUID = GPU = None
 DEVICES = ()
-HOST = IDS = MODULE_ALIASES = {}
+HOST = MODULE_ALIASES = {}
 MODULES = ()
 SYS, PROC, DEV = Path('/sys'), Path('/proc'), Path('/dev')
 STATE_DIR = Path('/run/nvidia-handoff')
@@ -89,21 +88,26 @@ def topology():
         raise Refuse('A display is connected/enabled on the selected NVIDIA GPU')
 
 
-def validate_xml(xml):
+def pci_address(address):
+    return '%04x:%02x:%02x.%x' % tuple(int(address.get(k, '0'), 0)
+                                      for k in ('domain', 'bus', 'slot', 'function'))
+
+
+def pci_entries(xml):
     root = ET.fromstring(xml)
+    return root, [(pci_address(dev.find('./source/address')), dev)
+                  for dev in root.findall('./devices/hostdev[@type="pci"]')
+                  if dev.find('./source/address') is not None]
+
+
+def validate_xml(xml):
+    root, entries = pci_entries(xml)
     if root.findtext('name') != VM or root.findtext('uuid') != UUID:
         raise Refuse('Domain identity does not match hook context')
-    found = []
-    for h in root.findall('./devices/hostdev'):
-        a = h.find('./source/address')
-        if h.get('type') != 'pci' or a is None:
-            continue
-        bdf = '%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function'))
-        if bdf in DEVICES:
-            if h.get('managed', 'no') not in ('no', 'yes'):
-                raise Refuse('Unsupported hostdev managed attribute')
-            found.append(bdf)
-    if sorted(found) != sorted(DEVICES):
+    selected = [(bdf, dev) for bdf, dev in entries if bdf in DEVICES]
+    if any(dev.get('managed', 'no') not in ('no', 'yes') for _, dev in selected):
+        raise Refuse('Unsupported hostdev managed attribute')
+    if sorted(bdf for bdf, _ in selected) != sorted(DEVICES):
         raise Refuse('Domain XML must contain all selected GPU PCI functions exactly once')
 
 
@@ -324,43 +328,39 @@ def process_start(pid):
         return None
 
 
-def assert_claim(state):
+def assert_claim(state, allow_domain=False):
     pid = state.get('claim_pid')
-    if (pid and pid != os.getpid() and state.get('claim_uuid') != UUID
+    if (pid and pid != os.getpid() and not (allow_domain and state.get('claim_uuid') == UUID)
             and process_start(pid) == state.get('claim_start')):
         raise Refuse('Another GPU attachment/start is in progress')
 
 
 def restore(s, rollback=False):
-    assert_claim(s)
+    assert_claim(s, allow_domain=True)
     target = s['before'] if rollback else s['host']
-    # This also rejects a manual recovery command while omm is running.
     topology()
     assert_x11()
-    if all(driver(b) == target['drivers'][b] for b in DEVICES):
+    changed = any(driver(b) != target['drivers'][b] for b in DEVICES)
+    if changed:
+        guard()
         for b in DEVICES:
-            write(pci(b) / 'driver_override', target['overrides'][b])
-        ungate(s)
-        if s['persistence']:
-            run('/usr/bin/systemctl', 'start', SERVICE)
-        state_path().unlink()
-        return
-    guard()
-    log('Rollback to original bindings' if rollback else 'Returning selected GPU PCI functions to host')
-    for b in DEVICES:
-        write(pci(b) / 'driver_override', target['drivers'][b] or 'none')
-    # Unbind VFIO first. No reset/remove/rescan, forced module removal or Xorg stop.
-    for b in reversed(DEVICES):
-        if driver(b) != target['drivers'][b] and driver(b):
-            bind(b, None)
+            write(pci(b) / 'driver_override', target['drivers'][b] or 'none')
+        for b in reversed(DEVICES):
+            if driver(b) != target['drivers'][b] and driver(b):
+                bind(b, None)
+    # A failed unload can remove DRM/UVM without changing the PCI binding.
     for mod in target['modules']:
-        run('/usr/sbin/modprobe', mod)
+        if not module_loaded(mod):
+            run('/usr/sbin/modprobe', mod)
     for b in DEVICES:
-        if target['drivers'][b]:
-            run('/usr/sbin/modprobe', next(d['host_module'] for d in SETTINGS['devices'] if d['bdf'] == b) if target['drivers'][b] == HOST[b] else target['drivers'][b])
-        bind(b, target['drivers'][b])
+        if changed and target['drivers'][b]:
+            module = next(d['host_module'] for d in SETTINGS['devices'] if d['bdf'] == b)
+            run('/usr/sbin/modprobe', module if target['drivers'][b] == HOST[b] else target['drivers'][b])
+        if changed:
+            bind(b, target['drivers'][b])
         write(pci(b) / 'driver_override', target['overrides'][b])
-    run('/usr/bin/udevadm', 'settle', '--timeout=10')
+    if changed:
+        run('/usr/bin/udevadm', 'settle', '--timeout=10')
     ungate(s)
     if s['persistence']:
         run('/usr/bin/systemctl', 'start', SERVICE)
@@ -382,16 +382,17 @@ def prepare(parking=False):
     assert_x11()
     if (STATE_DIR / 'uninstalling').exists():
         raise Refuse('Full cleanup is in progress')
-    if not parking and not isolated():
+    isolation = isolated()
+    if not parking and not isolation:
         raise Refuse('PCI passthrough requires isolated IOMMU groups containing only selected GPU functions')
-    parking_driver = 'vfio-pci' if isolated() else None
+    parking_driver = 'vfio-pci' if isolation else None
     if not parking and policy_target() not in (None, UUID):
         raise Refuse('GPU destination is locked by nvidia-handoff; select this VM in its GUI first')
     if (STATE_DIR / 'xorg-transition').exists() or xorg_mode() != 'off':
         raise Refuse('Xorg gaming mode/transition is active; run nvidia-handoff disconnect --restart-session first')
     existing = load()
     if existing is not None:
-        assert_claim(existing)
+        assert_claim(existing, allow_domain=not parking)
         if existing['phase'] != 'parked':
             raise Refuse('Outstanding transaction; release/recovery must complete first')
         guard()
@@ -446,21 +447,7 @@ def prepare(parking=False):
         s['phase'] = 'rollback'
         save(s)
         try:
-            # If no binding changed, undo harmless overrides/gates without unbinding
-            # an application which caused the busy check to fail.
-            if all(driver(b) == before['drivers'][b] for b in DEVICES):
-                for b in DEVICES:
-                    write(pci(b) / 'driver_override', before['overrides'][b])
-                for mod in before['modules']:
-                    if not module_loaded(mod):
-                        run('/usr/sbin/modprobe', mod)
-                ungate(s)
-                if s['persistence']:
-                    run('/usr/bin/systemctl', 'start', SERVICE)
-                state_path().unlink()
-                log('Pre-start changes rolled back; bindings unchanged')
-            else:
-                restore(s, rollback=True)
+            restore(s, rollback=True)
         except BaseException as exc:
             log('Rollback incomplete; state retained; no forced detach: ' + str(exc), True)
         raise
@@ -542,9 +529,16 @@ def lock(installing=False, cleaning=False):
 OPTIONAL_NS = 'urn:nvidia-handoff:optional:1'
 
 
+def optional_group(root):
+    groups = root.findall('./metadata/{' + OPTIONAL_NS + '}gpu[@bdf="' + GPU + '"]')
+    if len(groups) > 1:
+        raise Refuse('Duplicate optional GPU metadata')
+    return groups[0] if groups else None
+
+
 def optional_devices(root):
-    group = root.find('./metadata/{' + OPTIONAL_NS + '}gpu')
-    if group is None or group.get('bdf') != GPU:
+    group = optional_group(root)
+    if group is None:
         return []
     devices = list(group.findall('hostdev'))
     found = []
@@ -552,27 +546,23 @@ def optional_devices(root):
         a = dev.find('./source/address')
         if dev.get('type') != 'pci' or a is None:
             raise Refuse('Invalid optional GPU metadata')
-        found.append('%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function')))
+        found.append(pci_address(a))
     if sorted(found) != sorted(DEVICES):
         raise Refuse('Optional GPU metadata must contain all selected PCI functions exactly once')
     return devices
 
 
 def enable_optional_xml(xml):
-    root = ET.fromstring(xml)
+    root, entries = pci_entries(xml)
     existing = optional_devices(root)
-    if existing:
-        return None
-    selected = []
-    devices = root.find('devices')
-    for dev in devices.findall('hostdev'):
-        a = dev.find('./source/address')
-        if dev.get('type') == 'pci' and a is not None:
-            bdf = '%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function'))
-            if bdf in DEVICES:
-                selected.append(dev)
+    selected = [dev for bdf, dev in entries if bdf in DEVICES]
     if not selected:
         return None
+    devices = root.find('devices')
+    if existing:
+        for dev in selected:
+            devices.remove(dev)
+        return ET.tostring(root, encoding='unicode')
     meta = root.find('metadata')
     if meta is None:
         meta = ET.SubElement(root, 'metadata')
@@ -620,12 +610,7 @@ def prepare_guest_xml(xml):
         raise Refuse('Automatic preparation supports persistent x86_64 QEMU/KVM q35 or i440fx guests')
     devices = root.find('devices')
     if not optional_devices(root):
-        present = set()
-        for dev in devices.findall('hostdev[@type="pci"]'):
-            address = dev.find('./source/address')
-            if address is not None:
-                present.add('%04x:%02x:%02x.%x' % tuple(int(address.get(k, '0'), 0)
-                            for k in ('domain', 'bus', 'slot', 'function')))
+        present = {bdf for bdf, _ in pci_entries(xml)[1]}
         for bdf in DEVICES:
             if bdf in present:
                 continue
@@ -635,7 +620,9 @@ def prepare_guest_xml(xml):
             slot, function = rest.split('.')
             ET.SubElement(source, 'address', dict(domain='0x'+domain, bus='0x'+bus,
                                                    slot='0x'+slot, function='0x'+function))
-        root = ET.fromstring(enable_optional_xml(ET.tostring(root, encoding='unicode')))
+    converted = enable_optional_xml(ET.tostring(root, encoding='unicode'))
+    if converted is not None:
+        root = ET.fromstring(converted)
         devices = root.find('devices')
     token = GPU.replace(':', '_').replace('.', '_')
     extra = 0
@@ -670,7 +657,7 @@ def disable_optional_xml(xml):
     if not templates:
         return None
     meta = root.find('metadata')
-    meta.remove(meta.find('{' + OPTIONAL_NS + '}gpu'))
+    meta.remove(optional_group(root))
     token = GPU.replace(':', '_').replace('.', '_')
     devices = root.find('devices')
     for dev in list(devices):
@@ -699,21 +686,16 @@ def disable_optional_xml(xml):
 
 
 def boot_xml(xml, with_gpu):
-    root = ET.fromstring(xml)
+    root, entries = pci_entries(xml)
     templates = optional_devices(root)
     if not templates:
         raise Refuse('Guest is not configured for optional GPU passthrough')
     devices = root.find('devices')
-    for dev in list(devices.findall('hostdev')):
-        a = dev.find('./source/address')
-        if dev.get('type') == 'pci' and a is not None:
-            bdf = '%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function'))
-            if bdf in DEVICES:
-                devices.remove(dev)
+    for bdf, dev in entries:
+        if bdf in DEVICES:
+            devices.remove(dev)
     if with_gpu:
-        import copy
-        for dev in templates:
-            devices.append(copy.deepcopy(dev))
+        devices.extend(templates)  # The parsed tree is private to this boot.
     return ET.tostring(root, encoding='unicode')
 
 
@@ -726,10 +708,8 @@ def main(argv, xml=None):
         if tuple(argv[1:3]) not in (('prepare', 'begin'), ('release', 'end')):
             return 0
         xml = sys.stdin.read() if xml is None else xml
-        root = ET.fromstring(xml)
-        addresses = root.findall('./devices/hostdev[@type="pci"]/source/address')
-        related = any('%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function')) in DEVICES for a in addresses)
-        if not related:
+        root, entries = pci_entries(xml)
+        if not any(bdf in DEVICES for bdf, _ in entries):
             return 0
         VM = root.findtext('name')
         UUID = root.findtext('uuid')
@@ -899,7 +879,7 @@ def discover(gpu=None):
 
 
 def configure(config):
-    global SETTINGS, GPU, AUDIO, DEVICES, HOST, IDS, MODULES, MODULE_ALIASES, STATE_DIR, XORG_CONFIG, VM, UUID
+    global SETTINGS, GPU, DEVICES, HOST, MODULES, MODULE_ALIASES, STATE_DIR, XORG_CONFIG, VM, UUID
     if config.get('version') != 2:
         raise Refuse('Unsupported installation configuration version')
     devices = config['devices']
@@ -910,9 +890,7 @@ def configure(config):
     DEVICES = tuple(d['bdf'] for d in devices)
     if GPU not in DEVICES or len(set(DEVICES)) != len(DEVICES):
         raise Refuse('Invalid GPU/device scope')
-    AUDIO = next((d['bdf'] for d in devices if d['class'].startswith('0x04')), None)
     HOST = {d['bdf']: d['host_driver'] for d in devices}
-    IDS = {d['bdf']: d['device'] for d in devices}
     MODULE_ALIASES = {a: module_name(a) for a in ('nvidia', 'nvidia_modeset', 'nvidia_uvm', 'nvidia_drm')}
     MODULES = tuple(dict.fromkeys(MODULE_ALIASES.values()))
     STATE_DIR = Path(config['state_dir'])
@@ -997,6 +975,6 @@ def display_manager():
         values = dict(line.split('=', 1) for line in props.splitlines() if '=' in line)
         if values.get('LoadState') == 'loaded' and values.get('ActiveState') == 'active':
             return values.get('Id', unit)
-    raise Refuse('No active display manager. Set --display-manager UNIT during installation, or restart a manual Xorg session yourself.')
+    raise Refuse('No active display manager. Pass --display-manager UNIT before the command, or restart a manual Xorg session yourself.')
 
 

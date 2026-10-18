@@ -1,11 +1,9 @@
 """Isolated discovery and safety regression tests; no host/device mutations."""
-import ast
 import contextlib
 import io
 import json
 import os
 from pathlib import Path
-import stat
 import tempfile
 import types
 import unittest
@@ -26,6 +24,7 @@ class StatelessTests(unittest.TestCase):
         self.core = module('nvidia_handoff_core.py')
         self.app = module('nvidia-handoff')
         self.app.tag_guest_driver = Mock()
+        self.addCleanup(os.umask, os.umask(0o077))
         self.tmp = tempfile.TemporaryDirectory(prefix='.test-', dir=ROOT)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -58,7 +57,12 @@ class StatelessTests(unittest.TestCase):
             values = list(st)
             values[4] = 0
             return os.stat_result(values)
-        with patch.object(Path, 'lstat', lambda path: owned(lstat(path))), \
+        def owned_lstat(path):
+            values = list(owned(lstat(path)))
+            if path in self.root.parents:
+                values[0] &= ~0o022  # Fixture ancestors are outside the synthetic system.
+            return os.stat_result(values)
+        with patch.object(Path, 'lstat', owned_lstat), \
              patch.object(os, 'fstat', lambda fd: owned(fstat(fd))):
             yield
 
@@ -102,25 +106,17 @@ class StatelessTests(unittest.TestCase):
         with self.owned_paths(), self.assertRaises(self.core.Refuse):
             self.core.xorg_path()
 
-    def test_runtime_directory_discovered_from_transaction(self):
+    def test_runtime_discovery_uses_transaction_or_lock_tag(self):
         self.core.Path = self.mapped_path
         directory = self.root / 'run/legacy-gpu-handoff'
         directory.mkdir(parents=True, mode=0o700)
-        p = directory / 'state.json'
-        p.write_text(json.dumps({'host': {'drivers': {self.gpu: 'nvidia'}}}))
-        p.chmod(0o600)
-        with self.owned_paths():
-            self.assertEqual(self.core.runtime_path(self.gpu, [self.gpu]), str(directory))
-
-    def test_runtime_directory_remains_discoverable_without_transaction(self):
-        self.core.Path = self.mapped_path
-        directory = self.root / 'run/legacy-gpu-handoff'
-        directory.mkdir(parents=True, mode=0o700)
-        p = directory / 'lock'
-        p.write_text('nvidia-handoff ' + self.gpu + '\n')
-        p.chmod(0o600)
-        with self.owned_paths():
-            self.assertEqual(self.core.runtime_path(self.gpu, [self.gpu]), str(directory))
+        for name, data in [('state.json', json.dumps({'host': {'drivers': {self.gpu: 'nvidia'}}})),
+                           ('lock', 'nvidia-handoff ' + self.gpu + '\n')]:
+            with self.subTest(name=name), self.owned_paths():
+                p = directory / name
+                p.write_text(data)
+                self.assertEqual(self.core.runtime_path(self.gpu, [self.gpu]), str(directory))
+                p.unlink()
 
     def test_discovery_without_runtime_does_not_create_it(self):
         self.core.Path = self.mapped_path
@@ -129,21 +125,18 @@ class StatelessTests(unittest.TestCase):
         self.assertEqual(result, str(self.root / 'run/nvidia-handoff' / self.gpu))
         self.assertFalse((self.root / 'run').exists())
 
-    def test_stale_process_refuses_before_mkdir_without_settings_file(self):
+    def test_stale_or_uninstalled_process_refuses_before_mkdir(self):
         p = self.root / 'installed'
-        p.write_text('v1')
         self.core.SETTINGS = {'program_identity': {str(p): [1, 2, 3]}}
         self.core.STATE_DIR = self.root / 'state'
-        with patch.object(os, 'geteuid', return_value=0), self.assertRaises(self.core.Refuse):
-            self.core.lock()
-        self.assertFalse(self.core.STATE_DIR.exists())
-
-    def test_uninstalled_process_refuses_before_mkdir(self):
-        self.core.SETTINGS = {'program_identity': {str(self.root / 'removed'): [1, 2, 3]}}
-        self.core.STATE_DIR = self.root / 'state'
-        with patch.object(os, 'geteuid', return_value=0), self.assertRaises(self.core.Refuse):
-            self.core.lock()
-        self.assertFalse(self.core.STATE_DIR.exists())
+        for exists in (True, False):
+            if exists:
+                p.write_text('v1')
+            else:
+                p.unlink()
+            with self.subTest(exists=exists), patch.object(os, 'geteuid', return_value=0), self.assertRaises(self.core.Refuse):
+                self.core.lock()
+            self.assertFalse(self.core.STATE_DIR.exists())
 
     def test_receipts_preserve_shebang_and_both_comment_formats(self):
         for body in (self.app.HOOK, self.app.XORG_OFF, b'-- audio policy\\nreturn true\\n'):
@@ -159,12 +152,14 @@ class StatelessTests(unittest.TestCase):
                 if body.startswith(b'--'):
                     self.assertTrue(p.read_bytes().startswith(b'-- nvidia-handoff'))
 
-    def test_receipt_rejects_administrator_edit(self):
+    def test_modified_or_malformed_receipts_are_preserved(self):
         p = self.root / 'policy'
-        p.write_bytes(self.app.marked(self.app.XORG_OFF) + b'# edited\\n')
-        p.chmod(0o644)
-        with self.owned_paths(), self.assertRaises(self.app.Error):
-            self.app.receipt(p)
+        for data in (self.app.marked(self.app.XORG_OFF) + b'# edited\n',
+                     b'# nvidia-handoff sha256=broken original=off\n' + self.app.XORG_OFF):
+            p.write_bytes(data)
+            with self.subTest(data=data), self.owned_paths(), self.assertRaises(self.app.Error):
+                self.app.receipt(p)
+            self.assertEqual(p.read_bytes(), data)
 
     def test_xorg_toggle_preserves_original_and_refreshes_hash(self):
         p = self.root / 'policy'
@@ -239,13 +234,6 @@ class StatelessTests(unittest.TestCase):
         self.app.main(['start-vm', ident, '--without-gpu'])
         self.app.start_optional.assert_called_once_with(ident, without_gpu=True)
 
-
-    def test_malformed_receipt_is_not_adopted_as_user_policy(self):
-        p = self.root / 'policy'
-        p.write_bytes(b'# nvidia-handoff sha256=broken original=off\n' + self.app.XORG_OFF)
-        p.chmod(0o644)
-        with self.owned_paths(), self.assertRaises(self.app.Error):
-            self.app.receipt(p)
 
     def test_private_runtime_is_ignored_for_unprivileged_inventory(self):
         self.core.Path = self.mapped_path
@@ -408,6 +396,7 @@ class StatelessTests(unittest.TestCase):
         self.core.GPU = self.gpu
         self.core.DEVICES = (self.gpu, self.gpu[:-1]+'1')
         self.app.BDFS = self.core.DEVICES
+        self.app.load_hook = lambda: self.core
 
     def test_unprepared_vm_gets_complete_optional_templates_and_ports(self):
         self.configure_guest_devices()
@@ -438,6 +427,15 @@ class StatelessTests(unittest.TestCase):
         result = self.app.ET.fromstring(changed)
         self.assertIsNotNone(result.find('./devices/disk'))
         self.assertEqual(result.findtext('./metadata/{urn:user}note'), 'keep')
+        self.app.ET.SubElement(result.find('metadata'),
+            '{' + self.core.OPTIONAL_NS + '}gpu', {'bdf': '0000:03:00.0'})
+        # Existing metadata must not hide stale GPU devices in the persistent definition.
+        result.find('devices').extend(self.core.optional_devices(result))
+        repaired = self.core.prepare_guest_xml(self.app.ET.tostring(result, encoding='unicode'))
+        self.assertFalse(self.app.ET.fromstring(repaired).findall('./devices/hostdev'))
+        cleaned = self.app.ET.fromstring(self.core.disable_optional_xml(repaired))
+        self.assertIsNotNone(cleaned.find('./metadata/{' + self.core.OPTIONAL_NS + '}gpu[@bdf="0000:03:00.0"]'))
+
 
     def test_unprepared_i440fx_uses_existing_pci_bus(self):
         self.configure_guest_devices()
@@ -479,22 +477,15 @@ class StatelessTests(unittest.TestCase):
         d['needs_restart']=True
         self.assertEqual(self.app.operation_plan('vm',[d],False),([d],False))
 
-    def test_debian_detection_rejects_other_os_without_guest_exec(self):
-        self.app.guest_agent=Mock(return_value={'id':'ubuntu','version-id':'24.04','pretty-name':'Ubuntu'})
-        self.app.guest_exec=Mock(side_effect=AssertionError('must not execute'))
-        with self.assertRaises(self.app.Error):
-            self.app.debian_guest('vm')
-        self.app.guest_exec.assert_not_called()
-
-    def test_debian_detection_accepts_supported_guest(self):
-        self.app.guest_agent=Mock(return_value={'id':'debian','version-id':'13','pretty-name':'Debian'})
-        self.app.guest_exec=Mock(return_value=(0,'amd64\n'))
-        self.assertEqual(self.app.debian_guest('vm'),'13')
-
-    def test_missing_agent_has_actionable_error(self):
-        self.app.guest_agent=Mock(side_effect=self.app.Error('offline'))
-        with self.assertRaisesRegex(self.app.Error,'qemu-guest-agent'):
-            self.app.debian_guest('vm')
+    def test_debian_detection_accepts_supported_os_and_refuses_other_or_missing_agents(self):
+        self.app.guest_agent = Mock(side_effect=[self.app.Error('offline'),
+            {'id': 'ubuntu', 'version-id': '24.04'}, {'id': 'debian', 'version-id': '13'}])
+        self.app.guest_exec = Mock(return_value=(0, 'amd64\n'))
+        for message in ('qemu-guest-agent', 'Debian 12 and 13 only'):
+            with self.assertRaisesRegex(self.app.Error, message):
+                self.app.debian_guest('vm')
+            self.app.guest_exec.assert_not_called()
+        self.assertEqual(self.app.debian_guest('vm'), '13')
 
     def test_guest_exec_decodes_result_without_running_a_command(self):
         self.app.guest_agent=Mock(side_effect=[{'pid':42},{'exited':True,'exitcode':0,
@@ -510,37 +501,36 @@ class StatelessTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(self.app.Error):
                 self.app.recommended_driver_packages(text)
 
-    def test_ready_guest_skips_all_package_changes(self):
-        self.app.load_hook=Mock()
-        self.app.debian_guest=Mock(return_value='13')
-        self.app.guest_driver_ready=Mock(return_value=True)
-        self.app.guest_exec=Mock(side_effect=AssertionError('no packages needed'))
-        self.assertIn('ready', self.app.setup_guest_driver('vm','job','vm'))
-        self.app.guest_exec.assert_not_called()
+    def driver_fixture(self, readiness, commands=()):
+        self.app.load_hook = Mock()
+        self.app.operation_status = Mock()
+        self.app.debian_guest = Mock(return_value='13')
+        self.app.guest_driver_ready = Mock(side_effect=readiness)
+        self.app.guest_exec = Mock(side_effect=commands)
+        self.app.virsh = Mock()
 
-    def test_failed_package_bootstrap_keeps_gpu_and_does_not_reboot(self):
-        self.app.load_hook=Mock()
-        self.app.operation_status=Mock()
-        self.app.debian_guest=Mock(return_value='13')
-        self.app.guest_driver_ready=Mock(return_value=False)
-        self.app.guest_exec=Mock(return_value=(1,'no network'))
-        self.app.virsh=Mock(side_effect=AssertionError('must not reboot or unplug'))
-        with self.assertRaisesRegex(self.app.Error,'GPU remains attached'):
-            self.app.setup_guest_driver('vm','job','vm')
-        self.app.virsh.assert_not_called()
-        self.app.tag_guest_driver.assert_not_called()
+    def test_ready_guest_skips_all_package_changes(self):
+        self.driver_fixture([True])
+        self.assertIn('ready', self.app.setup_guest_driver('vm', 'job', 'vm'))
+        self.app.guest_exec.assert_not_called()
+        self.app.tag_guest_driver.assert_called_once_with('vm')
+
+    def test_package_failures_keep_gpu_without_reboot_or_tag(self):
+        for commands in ([(1, 'no network')],
+                         [(0, ''), (0, 'sudo apt install -y nvidia-open'), (1, 'removal required')]):
+            with self.subTest(commands=commands):
+                self.driver_fixture([False], commands)
+                with self.assertRaisesRegex(self.app.Error, 'GPU remains attached'):
+                    self.app.setup_guest_driver('vm', 'job', 'vm')
+                self.app.virsh.assert_not_called()
+                self.app.tag_guest_driver.assert_not_called()
 
     def test_driver_packages_are_simulated_and_cannot_remove_packages(self):
-        self.app.load_hook=Mock()
-        self.app.operation_status=Mock()
-        self.app.debian_guest=Mock(return_value='13')
-        self.app.guest_driver_ready=Mock(side_effect=[False,True])
-        self.app.guest_exec=Mock(side_effect=[(0,''),(0,'sudo apt install -y nvidia-open'),(0,''),(0,'')])
-        self.assertIn('ready',self.app.setup_guest_driver('vm','job','vm'))
-        install=self.app.guest_exec.call_args_list[2:]
-        self.assertIn('--simulate',install[0].args[2])
+        self.driver_fixture([False, True], [(0, ''), (0, 'sudo apt install -y nvidia-open'), (0, ''), (0, '')])
+        self.assertIn('ready', self.app.setup_guest_driver('vm', 'job', 'vm'))
+        install = self.app.guest_exec.call_args_list[2:]
+        self.assertIn('--simulate', install[0].args[2])
         self.assertTrue(all('--no-remove' in call.args[2] for call in install))
-
 
     def test_preparation_defines_only_inactive_xml_and_rechecks_edits(self):
         self.configure_guest_devices()
@@ -556,47 +546,56 @@ class StatelessTests(unittest.TestCase):
             self.app.prepare_vm_definition('vm')
         self.app.virsh_input.assert_not_called()
 
-    def test_new_vm_pipeline_prepares_before_boot_then_installs_driver(self):
+    @contextlib.contextmanager
+    def switching_fixture(self, record):
         self.configure_guest_devices()
-        d=dict(uuid='vm',name='vm',state='shut off',eligible=True,optional=False,live_gpu=[])
-        self.app.inventory=lambda:[d]
-        self.app.xorg_owners=lambda h:set()
-        self.app.operation_status=Mock()
-        self.app.worker=Mock()
-        h=Mock()
-        h.assert_x11=Mock()
-        h.xorg_mode.return_value='off'
-        h.load.return_value=None
-        locked=[False]
+        h, active = Mock(), []
+        h.assert_x11 = Mock()
+        h.xorg_mode.return_value = 'off'
+        h.driver.return_value = 'vfio-pci'
+        h.load.return_value = None
+        self.app.load_hook = lambda: h
+        self.app.xorg_owners = lambda h: set()
+        self.app.operation_status, self.app.worker = Mock(), Mock()
+        def inventory():
+            self.assertFalse(active, 'libvirt query under GPU lock')
+            return [record]
         def acquire():
-            self.assertFalse(locked[0])
-            locked[0]=True
-            return os.open(self.root/'lock',os.O_CREAT|os.O_RDWR,0o600)
-        close=os.close
+            self.assertFalse(active, 'nested GPU lock')
+            active.append(os.open(self.root / 'lock', os.O_CREAT | os.O_RDWR, 0o600))
+            return active[0]
+        close = os.close
         def release(fd):
-            locked[0]=False
+            self.assertEqual(active.pop(), fd)
             close(fd)
-        h.lock=acquire
-        self.app.load_hook=lambda:h
-        events=[]
-        def prepare(ident):
-            self.assertFalse(locked[0])
-            events.append('prepare')
-            d['optional']=True
-        def start(ident):
-            self.assertFalse(locked[0])
-            events.append('start')
-            d.update(state='running',live_gpu=list(self.app.BDFS))
-        def driver(*args):
-            self.assertFalse(locked[0])
-            events.append('driver')
-            return 'ready'
-        self.app.prepare_vm_definition=prepare
-        self.app.start_optional=start
-        self.app.setup_guest_driver=driver
-        with patch.object(os,'geteuid',return_value=0),patch.object(os,'close',release):
-            self.app.selection_worker('vm','job',False,False,True,True)
-        self.assertEqual(events,['prepare','start','driver'])
+        h.lock, self.app.inventory = acquire, inventory
+        with patch.object(os, 'geteuid', return_value=0), patch.object(os, 'close', release):
+            yield h, active
+        self.assertFalse(active)
+
+    def test_new_vm_pipeline_prepares_before_boot_then_installs_driver(self):
+        d = dict(uuid='vm', name='vm', state='shut off', eligible=True, optional=False, live_gpu=[])
+        with self.switching_fixture(d) as (h, active):
+            events = []
+            def prepare(ident):
+                self.assertFalse(active)
+                events.append('prepare')
+                d['optional'] = True
+            def start(ident):
+                self.assertFalse(active)
+                events.append('start')
+                d.update(state='running', live_gpu=list(self.app.BDFS))
+            def driver(*args):
+                self.assertFalse(active)
+                events.append('driver')
+                return 'ready'
+            self.app.prepare_vm_definition, self.app.start_optional, self.app.setup_guest_driver = prepare, start, driver
+            self.app.selection_worker('vm', 'job', False, False, True, True)
+            self.assertEqual(events, ['prepare', 'start', 'driver'])
+            h.assert_x11.side_effect = self.core.Refuse('Wayland')
+            with self.assertRaisesRegex(self.core.Refuse, 'Wayland'):
+                self.app.selection_worker('vm', 'job', False, False)
+            self.assertEqual(self.app.operation_status.call_args.args[2], 'error')
 
     def test_guest_exec_timeout_reports_pid_without_killing_process(self):
         self.app.guest_agent=Mock(side_effect=[{'pid':42},{'exited':False}])
@@ -613,60 +612,28 @@ class StatelessTests(unittest.TestCase):
         self.app.guest_exec=Mock(return_value=(0,'0x123410DE\n'))
         self.assertFalse(self.app.guest_driver_ready('vm'))
 
-    def test_package_failure_never_requests_reboot(self):
-        self.app.load_hook=Mock()
-        self.app.operation_status=Mock()
-        self.app.debian_guest=Mock(return_value='13')
-        self.app.guest_driver_ready=Mock(return_value=False)
-        self.app.guest_exec=Mock(side_effect=[(0,''),(0,'sudo apt install -y nvidia-open'),(1,'removal required')])
-        self.app.virsh=Mock(side_effect=AssertionError('must not reboot'))
-        with self.assertRaisesRegex(self.app.Error,'package operation failed'):
-            self.app.setup_guest_driver('vm','job','vm')
-        self.app.virsh.assert_not_called()
-
     def test_driver_setup_reboots_once_only_after_confirmed_install(self):
-        self.app.load_hook=Mock()
-        self.app.operation_status=Mock()
-        self.app.debian_guest=Mock(return_value='13')
-        self.app.guest_driver_ready=Mock(side_effect=[False,False,True])
-        old='11111111-1111-1111-1111-111111111111\n'
-        new='22222222-2222-2222-2222-222222222222\n'
-        self.app.guest_exec=Mock(side_effect=[(0,''),(0,'sudo apt install -y nvidia-open'),(0,''),(0,''),(0,old),(0,new)])
-        self.app.virsh=Mock()
+        old = '11111111-1111-1111-1111-111111111111\n'
+        new = '22222222-2222-2222-2222-222222222222\n'
+        self.driver_fixture([False, False, True],
+            [(0, ''), (0, 'sudo apt install -y nvidia-open'), (0, ''), (0, ''), (0, old), (0, new)])
         with patch.object(self.app.time,'sleep'):
             self.assertIn('after guest reboot',self.app.setup_guest_driver('vm','job','vm'))
         self.app.virsh.assert_called_once_with('reboot','vm','--mode','agent')
 
 
     def test_connected_guest_can_retry_driver_setup_without_gpu_switch(self):
-        self.configure_guest_devices()
-        d=dict(uuid='vm',name='vm',state='running',eligible=True,optional=True,live_gpu=list(self.app.BDFS))
-        self.app.inventory=lambda:[d]
-        self.app.xorg_owners=lambda h:set()
-        self.app.debian_guest=Mock(return_value='13')
-        self.app.operation_status=Mock()
-        self.app.worker=Mock(side_effect=AssertionError('must not switch host mode'))
-        h=Mock()
-        h.assert_x11=Mock()
-        h.driver.return_value='vfio-pci'
-        self.app.load_hook=lambda:h
-        locked=[False]
-        def acquire():
-            locked[0]=True
-            return os.open(self.root/'lock',os.O_CREAT|os.O_RDWR,0o600)
-        close=os.close
-        def release(fd):
-            locked[0]=False
-            close(fd)
-        h.lock=acquire
-        def driver(*args):
-            self.assertFalse(locked[0])
-            return 'ready'
-        self.app.setup_guest_driver=Mock(side_effect=driver)
-        with patch.object(os,'geteuid',return_value=0),patch.object(os,'close',release):
-            self.app.selection_worker('vm','job',False,False,True,True)
-        self.app.setup_guest_driver.assert_called_once()
-        self.app.worker.assert_not_called()
+        d = dict(uuid='vm', name='vm', state='running', eligible=True, optional=True, live_gpu=[])
+        with self.switching_fixture(d) as (h, active):
+            d['live_gpu'] = list(self.app.BDFS)
+            self.app.debian_guest = Mock(return_value='13')
+            def driver(*args):
+                self.assertFalse(active)
+                return 'ready'
+            self.app.setup_guest_driver = Mock(side_effect=driver)
+            self.app.selection_worker('vm', 'job', False, False, True, True)
+            self.app.setup_guest_driver.assert_called_once()
+            self.app.worker.assert_not_called()
 
     def test_current_target_guard_accounts_for_live_guest_driver_readiness(self):
         self.configure_guest_devices()
@@ -680,6 +647,10 @@ class StatelessTests(unittest.TestCase):
         d['driver_ready']=True
         self.app.GPUWindow.show_inventory(window,[d],False,'vfio-pci')
         self.assertEqual(window.current_target,'vm')
+        for uvm in (False, True):
+            self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', uvm)
+            self.assertEqual(window.current_target, 'cuda' if uvm else None)
+
 
 
     def test_ready_vm_confirmation_has_no_preparation_or_package_warning(self):
@@ -700,23 +671,27 @@ class StatelessTests(unittest.TestCase):
         self.assertIn('driver license',text)
         self.assertIn('one graceful guest reboot',text)
 
-    def test_gui_prepared_vm_dispatch_omits_setup_options_by_default(self):
+    def test_ready_vm_dispatch_confirms_only_when_untagged(self):
         self.configure_guest_devices()
-        record=dict(uuid='vm',name='ready',state='shut off',eligible=True,prepared=True,
-                    optional=True,live_gpu=[],driver_ready=None)
-        window=types.SimpleNamespace(tree=Mock(),busy=False,current_target='cuda',records=[record],
-            attached=False,rows={'vm':('vm','ready','Virtual machine','',True)},
-            root=Mock(),selected_vm=lambda:record,progress=Mock(),update_button=Mock())
-        window.tree.selection.return_value=('vm',)
-        self.app.SwitchDialog=Mock()
-        self.app.SwitchDialog.return_value.show.return_value=(True,False)
-        self.app.subprocess.Popen=Mock()
-        self.app.GPUWindow.apply(window)
-        args=self.app.subprocess.Popen.call_args.args[0]
-        self.assertNotIn('--prepare-vm',args)
-        self.assertNotIn('--setup-driver',args)
-        self.assertFalse(self.app.SwitchDialog.call_args.kwargs['default_driver'])
-
+        record = dict(uuid='vm', name='ready', state='shut off', eligible=True,
+                      prepared=True, optional=True, live_gpu=[], driver_ready=None)
+        window = types.SimpleNamespace(tree=Mock(), busy=False, current_target='cuda', records=[record],
+            attached=False, rows={'vm': ('vm', 'ready', 'Virtual machine', '', True)},
+            root=Mock(), selected_vm=lambda: record, progress=Mock(), update_button=Mock())
+        window.tree.selection.return_value = ('vm',)
+        for tagged in (False, True):
+            with self.subTest(tagged=tagged):
+                record['driver_tagged'], window.busy = tagged, False
+                self.app.SwitchDialog = Mock()
+                self.app.SwitchDialog.return_value.show.return_value = (True, False)
+                window.start_process = Mock()
+                self.app.GPUWindow.apply(window)
+                args = window.start_process.call_args.args[0]
+                self.assertNotIn('--prepare-vm', args)
+                self.assertNotIn('--setup-driver', args)
+                self.assertEqual(self.app.SwitchDialog.call_count, 0 if tagged else 1)
+                if not tagged:
+                    self.assertFalse(self.app.SwitchDialog.call_args.kwargs['default_driver'])
 
     @unittest.skipUnless(os.environ.get('NVIDIA_HANDOFF_GUI_TESTS') == '1', 'Enable mapped display checks explicitly')
     def test_confirmation_dialog_resizes_at_96_144_192_dpi(self):
@@ -789,29 +764,139 @@ class StatelessTests(unittest.TestCase):
         clean=self.core.disable_optional_xml(changed)
         self.assertNotIn('driver-verified',clean)
 
-    def test_successful_guest_setup_records_tag_but_failed_setup_does_not(self):
-        self.app.load_hook=Mock()
-        self.app.debian_guest=Mock(return_value='13')
-        self.app.guest_driver_ready=Mock(return_value=True)
-        self.app.setup_guest_driver('vm','job','vm')
-        self.app.tag_guest_driver.assert_called_once_with('vm')
+    def test_file_write_refuses_symlink_ancestors_before_creating_directories(self):
+        real = self.root / 'real'
+        real.mkdir()
+        link = self.root / 'link'
+        link.symlink_to(real, target_is_directory=True)
+        with self.owned_paths(), self.assertRaises(self.app.Error):
+            self.app.write_file(link / 'nested' / 'file', b'never written')
+        self.assertFalse(list(real.iterdir()))
 
-    def test_tagged_ready_vm_dispatches_without_confirmation_or_driver_setup(self):
+    def test_lock_scope_releases_after_errors(self):
+        fd = os.open(self.root / 'lock', os.O_CREAT | os.O_RDWR, 0o600)
+        h = types.SimpleNamespace(lock=lambda: fd)
+        with self.assertRaisesRegex(ValueError, 'failure'):
+            with self.app.locked(h):
+                raise ValueError('failure')
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
+    def test_another_worker_cannot_take_same_guest_claim(self):
+        h = self.core
+        h.UUID = 'guest'
+        h.process_start = lambda pid: 'start'
+        state = dict(claim_pid=os.getpid() + 1, claim_start='start', claim_uuid='guest')
+        with self.assertRaises(h.Refuse):
+            h.assert_claim(state)
+        h.assert_claim(state, allow_domain=True)  # Synchronous libvirt hook.
+
+    def test_rollback_restores_modules_or_retains_state_when_busy(self):
+        h = self.core
+        h.GPU, h.DEVICES = self.gpu, (self.gpu,)
+        h.HOST = {self.gpu: 'nvidia'}
+        h.STATE_DIR = self.root
+        before = dict(drivers=dict(h.HOST), overrides={self.gpu: ''}, modules=['nvidia_drm'])
+        state = dict(before=before, host=before, persistence=False, gates=[])
+        h.topology = h.assert_x11 = h.write = h.ungate = h.log = Mock()
+        h.driver = lambda b: 'nvidia'
+        h.module_loaded = lambda m: False
+        h.run, h.bind = Mock(), Mock()
+        h.guard = Mock(side_effect=h.Refuse('busy'))
+        h.save(state)
+        h.restore(state, rollback=True)
+        h.run.assert_called_once_with('/usr/sbin/modprobe', 'nvidia_drm')
+        h.bind.assert_not_called()
+        self.assertFalse(h.state_path().exists())
+        h.save(state)
+        h.driver = lambda b: 'vfio-pci'
+        with self.assertRaisesRegex(h.Refuse, 'busy'):
+            h.restore(state, rollback=True)
+        self.assertTrue(h.state_path().exists())
+        h.bind.assert_not_called()
+
+    def test_one_time_boot_and_gpu_free_boot_leave_persistent_xml_unchanged(self):
         self.configure_guest_devices()
-        record=dict(uuid='vm',name='ready',state='shut off',eligible=True,prepared=True,
-                    optional=True,live_gpu=[],driver_ready=None,driver_tagged=True)
-        window=types.SimpleNamespace(tree=Mock(),busy=False,current_target='cuda',records=[record],
-            attached=False,rows={'vm':('vm','ready','Virtual machine','',True)},
-            root=Mock(),selected_vm=lambda:record,progress=Mock(),update_button=Mock())
-        window.tree.selection.return_value=('vm',)
-        self.app.SwitchDialog=Mock(side_effect=AssertionError('dialog must be skipped'))
-        self.app.subprocess.Popen=Mock()
-        self.app.GPUWindow.apply(window)
-        args=self.app.subprocess.Popen.call_args.args[0]
-        self.assertNotIn('--prepare-vm',args)
-        self.assertNotIn('--setup-driver',args)
-        self.app.SwitchDialog.assert_not_called()
+        h = self.core
+        xml = h.prepare_guest_xml(self.guest_xml())
+        root = self.app.ET.fromstring(xml)
+        self.app.optional_templates = lambda ident: (h, root, h.optional_devices(root))
+        self.app.virsh = Mock(side_effect=lambda *args: 'shut off' if args[0] == 'domstate' else '')
+        self.app.ensure_integration = Mock()
+        self.app.mark_claim, self.app.finish_claim = Mock(), Mock()
+        self.app.virsh_input = Mock()
+        h.policy_target, h.xorg_mode = lambda: None, lambda: 'off'
+        h.park, h.choose_target = Mock(), Mock()
+        h.lock = Mock(side_effect=lambda: os.open(self.root / 'lock', os.O_CREAT | os.O_RDWR, 0o600))
+        for without_gpu in (True, False):
+            with self.subTest(without_gpu=without_gpu):
+                self.app.start_optional('guest', without_gpu)
+                boot, *command = self.app.virsh_input.call_args.args
+                self.assertEqual(command, ['create', '/dev/stdin', '--validate'])
+                self.assertEqual(len(h.pci_entries(boot)[1]), 0 if without_gpu else 2)
+                self.assertEqual(self.app.ET.tostring(root, encoding='unicode'), xml)
+                if without_gpu:
+                    h.lock.assert_not_called()
+        self.app.virsh_input.side_effect = self.app.Error('boot failed')
+        with self.assertRaisesRegex(self.app.Error, 'boot failed'):
+            self.app.start_optional('guest')
+        self.assertEqual(self.app.finish_claim.call_count, 2)
 
+    def test_busy_descriptors_and_mappings_refuse_handoff(self):
+        h = self.core
+        h.PROC = self.root / 'proc'
+        process = h.PROC / str(os.getpid() + 1)
+        (process / 'fd').mkdir(parents=True)
+        (process / 'cmdline').write_bytes(b'workload')
+        (process / 'maps').write_text('')
+        fd = process / 'fd/7'
+        fd.symlink_to('/dev/null')
+        with self.assertRaisesRegex(h.Refuse, 'Device busy'):
+            h.idle({Path('/dev/null')})
+        fd.unlink()
+        (process / 'maps').write_text('1000-2000 rw-s 00000000 00:00 0 /dev/null')
+        with self.assertRaisesRegex(h.Refuse, 'mapping is still active'):
+            h.idle({Path('/dev/null')})
+
+    def test_partial_hotplug_keeps_assignment_and_releases_claim(self):
+        d = dict(uuid='vm', name='vm', state='running', eligible=True, optional=True, live_gpu=[])
+        with self.switching_fixture(d) as (h, active):
+            core = self.core
+            root = self.app.ET.fromstring(core.prepare_guest_xml(self.guest_xml()))
+            self.app.optional_templates = lambda ident: (h, root, core.optional_devices(root))
+            h.STATE_DIR, h.pci_address = self.root, core.pci_address
+            self.app.mark_claim, self.app.finish_claim = Mock(), Mock()
+            def attach(xml, *args):
+                self.assertFalse(active)
+                self.assertEqual(args, ('attach-device', 'vm', '/dev/stdin', '--live'))
+                if d['live_gpu']:
+                    raise self.app.Error('audio attach failed')
+                d['live_gpu'].append(self.gpu)
+            self.app.virsh_input = attach
+            with self.assertRaisesRegex(self.app.Error, 'audio attach failed'):
+                self.app.attach_running('vm')
+            self.assertEqual(d['live_gpu'], [self.gpu])
+            h.release.assert_not_called()
+            self.app.finish_claim.assert_called_once_with(h)
+
+    def test_gui_runner_drains_large_output_and_reports_launch_failure(self):
+        window = types.SimpleNamespace(messages=self.app.queue.Queue(), progress=Mock(), update_button=Mock())
+        self.app.GPUWindow.start_process(window, ['/usr/bin/python3', '-I', '-c',
+            'import sys; print("x"*200000); sys.stderr.write("y"*200000)'], 'Running')
+        kind, token, code, error = window.messages.get(timeout=10)
+        self.assertEqual((kind, code, len(error)), ('process', 0, 200000))
+        with patch.object(self.app.subprocess, 'run', side_effect=OSError('launch failed')):
+            self.app.GPUWindow.start_process(window, ['unused'], 'Running')
+            self.assertEqual(window.messages.get(timeout=10), ('process', window.command_id, 1, 'launch failed'))
+        window.starting, window.cleaning, window.job = 'example', False, None
+        window.root, window.refresh, window.poll = Mock(), Mock(), Mock()
+        window.refreshing, window.last_refresh = False, self.app.time.monotonic()
+        window.messages.put(('process', token, 1, 'stale result'))
+        window.messages.put(('process', window.command_id, 0, ''))
+        self.app.GPUWindow.poll(window)
+        self.assertFalse(window.busy)
+        self.assertIsNone(window.starting)
+        window.progress.set.assert_called_with('example started without GPU.')
 
 
 if __name__ == '__main__':
