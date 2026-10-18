@@ -24,7 +24,7 @@ import time
 import types
 import shutil
 
-SETTINGS_PATH = Path('/etc/nvidia-handoff.json')
+LEGACY_CONFIG = Path('/etc/nvidia-handoff.json')
 SETTINGS = {}
 BDFS = ()
 GPU = None
@@ -46,14 +46,26 @@ def run(*args):
     return p.stdout.strip()
 
 
-def initialize():
+def initialize(gpu=None, display_manager=None):
     global SETTINGS, BDFS, GPU, LABEL, CONFIG
-    validate_root_file(SETTINGS_PATH)
-    SETTINGS = json.loads(SETTINGS_PATH.read_text())
     h = load_core()
+    SETTINGS = h.discover(gpu)
+    SETTINGS['hook_path'] = str(hook_path())
+    SETTINGS['display_manager'] = display_manager
+    SETTINGS['program_identity'] = {}
+    for path in (Path(__file__).resolve(), Path(__file__).resolve().with_name('nvidia_handoff_core.py')):
+        st = path.lstat()
+        SETTINGS['program_identity'][str(path)] = (st.st_dev, st.st_ino, st.st_mtime_ns)
     h.configure(SETTINGS)
     BDFS, GPU = h.DEVICES, h.GPU
-    LABEL, CONFIG = SETTINGS.get('label', 'NVIDIA GPU'), h.XORG_CONFIG
+    LABEL, CONFIG = SETTINGS['label'], h.XORG_CONFIG
+
+
+def program_command(*args):
+    command = ['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--gpu', GPU]
+    if SETTINGS.get('display_manager'):
+        command += ['--display-manager', SETTINGS['display_manager']]
+    return command + list(args)
 
 
 def validate_root_file(path):
@@ -123,25 +135,16 @@ def load_hook():
 
 
 def atomic_config(data):
-    s = CONFIG.lstat()
-    if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o022:
-        raise Error('Unsafe Xorg configuration ownership/permissions')
-    tmp = CONFIG.with_name('.' + CONFIG.name + '.nvidia-handoff.new')
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        with os.fdopen(fd, 'wb') as out:
-            out.write(data)
-            out.flush()
-            os.fsync(out.fileno())
-            os.fchown(out.fileno(), s.st_uid, s.st_gid)
-            os.fchmod(out.fileno(), stat.S_IMODE(s.st_mode))
-        os.replace(tmp, CONFIG)
-        SETTINGS['xorg_applied_mode'] = re.findall(rb'(?im)^\s*Option\s+"AutoAddGPU"\s+"(off|on)"\s*$', data)[0].decode().lower()
-        if str(CONFIG) in SETTINGS.get('managed_files', {}):
-            SETTINGS['managed_files'][str(CONFIG)] = digest(data)
-        write_file(SETTINGS_PATH, (json.dumps(SETTINGS, indent=2) + '\n').encode())
-    finally:
-        tmp.unlink(missing_ok=True)
+    validate_root_file(CONFIG)
+    old, original = receipt(CONFIG)
+    if original is None:
+        modes = re.findall(rb'(?im)^\s*Option\s+"AutoAddGPU"\s+"(off|on)"\s*$', old)
+        if len(modes) != 1:
+            raise Error('Expected one AutoAddGPU off/on option')
+        original = modes[0].decode().lower()
+    # The caller may have toggled the body of an already marked policy.
+    data = RECEIPT.sub(b'', data)
+    write_file(CONFIG, marked(data, original), stat.S_IMODE(CONFIG.stat().st_mode))
 
 
 def xorg_processes(h):
@@ -274,10 +277,10 @@ def switch(mode, restart):
     require_stopped()  # Refuse a running VM before prompting for a password.
     if os.geteuid() != 0:
         print('Administrator authentication is needed to switch Xorg mode.', flush=True)
-        os.execv('/usr/bin/sudo', ['sudo', '/usr/bin/python3', '-I', str(Path(__file__).resolve()), mode, '--restart-session'])
+        os.execv('/usr/bin/sudo', ['sudo', *program_command(mode, '--restart-session')])
     load_hook()  # Fail before scheduling if the installed interlock is unavailable.
     run('/usr/bin/systemd-run', '--unit=nvidia-handoff', '--collect', '--property=Type=exec',
-        '/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--worker', mode)
+        *program_command('--worker', mode))
     print('Switch scheduled. The login manager will log out this session. Log: sudo journalctl -u ' + UNIT)
 
 
@@ -662,7 +665,7 @@ def select_destination(target, job, shutdown, restart):
     if not hasattr(h, 'park'):
         raise Error('Install the GUI handoff update first.')
     ensure_integration(vm=target not in ('none', 'xorg', 'cuda'))
-    args = ['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--selection-worker', target, '--job-id', job]
+    args = program_command('--selection-worker', target, '--job-id', job)
     caller = os.environ.get('PKEXEC_UID')
     if caller:
         status_file(int(caller), job)
@@ -884,8 +887,7 @@ class GPUWindow:
         record = self.selected_vm()
         if self.busy or not record or record['state'] != 'shut off' or record.get('startup_gpu', False):
             return
-        self.process = subprocess.Popen(['/usr/bin/python3', '-I', str(Path(__file__).resolve()),
-            'start-vm', record['uuid'], '--without-gpu'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.process = subprocess.Popen(program_command('start-vm', record['uuid'], '--without-gpu'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.starting = record['name']
         self.job = None
         self.busy = True
@@ -916,8 +918,7 @@ class GPUWindow:
         if not messagebox.askokcancel('Switch GPU', '\n\n'.join(changes), parent=self.root):
             return
         self.job = str(uuid.uuid4())
-        args = ['/usr/bin/pkexec', '--disable-internal-agent', '/usr/bin/python3', '-I', str(Path(__file__).resolve()),
-                'select', target, '--job-id', self.job]
+        args = ['/usr/bin/pkexec', '--disable-internal-agent', *program_command('select', target, '--job-id', self.job)]
         if stops:
             args.append('--shutdown-owner')
         if restart:
@@ -938,7 +939,7 @@ class GPUWindow:
         self.cleaning = self.busy = True
         self.job = None
         self.process = subprocess.Popen(['/usr/bin/pkexec', '--disable-internal-agent',
-            '/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--cleanup', '--yes'],
+            *program_command('--cleanup', '--yes')],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.progress.set('Waiting for administrator authentication…')
         self.update_button()
@@ -1068,13 +1069,57 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def check_managed(path, data, config):
+RECEIPT = re.compile(rb'(?m)^(?:#|--) nvidia-handoff sha256=([0-9a-f]{64}) original=(absent|on|off)\n')
+
+
+def marked(data, original='absent'):
+    prefix = b'--' if data.startswith(b'--') else b'#'
+    marker = prefix + b' nvidia-handoff sha256=' + digest(data).encode() + b' original=' + original.encode() + b'\n'
+    if data.startswith(b'#!'):
+        first, rest = data.split(b'\n', 1)
+        return first + b'\n' + marker + rest
+    return marker + data
+
+
+def receipt(path):
+    validate_root_file(path)
+    data = path.read_bytes()
+    matches = list(RECEIPT.finditer(data))
+    if not matches:
+        if b'nvidia-handoff sha256=' in data:
+            raise Error('Invalid ownership receipt: ' + str(path))
+        return data, None
+    body = RECEIPT.sub(b'', data)
+    if len(matches) != 1 or b'nvidia-handoff sha256=' in body or digest(body).encode() != matches[0][1]:
+        raise Error('Preserving administrator-modified file: ' + str(path))
+    return body, matches[0][2].decode()
+
+
+def hook_path():
+    found = []
+    try:
+        for path in Path('/etc/libvirt/hooks/qemu.d').glob('*'):
+            if path.is_symlink() or not path.is_file():
+                continue
+            # Ignore unrelated hooks without assuming their contents are ours.
+            if b'/opt/nvidia-handoff --libvirt-hook' not in path.read_bytes():
+                continue
+            body, original = receipt(path)
+            if body != HOOK or original not in (None, 'absent'):
+                raise Error('Preserving administrator-modified hook: ' + str(path))
+            found.append(path)
+    except PermissionError:
+        pass  # Unprivileged inventory never needs to inspect a private hook directory.
+    if len(found) > 1:
+        raise Error('Duplicate NVIDIA handoff hooks; resolve them before switching')
+    return found[0] if found else Path('/etc/libvirt/hooks/qemu.d/50-nvidia-handoff')
+
+
+def check_managed(path, data):
     if not path.exists() and not path.is_symlink():
         return
-    validate_root_file(path)
-    current = path.read_bytes()
-    recorded = config.get('managed_files', {}).get(str(path))
-    if current != data and (not recorded or digest(current) != recorded):
+    body, original = receipt(path)
+    if body != data:
         raise Error('Preserving administrator-modified file: ' + str(path))
 
 
@@ -1096,6 +1141,12 @@ def write_file(path, data, mode=0o644):
             tmp.unlink(missing_ok=True)
 
 
+def refresh_hooks():
+    for daemon in ('virtqemud.service', 'libvirtd.service'):
+        if run('/usr/bin/systemctl', 'show', daemon, '-p', 'ActiveState', '--value') == 'active':
+            run('/usr/bin/systemctl', 'kill', '--kill-whom=main', '--signal=HUP', daemon)
+
+
 def ensure_integration(vm=False):
     """Called only by an explicit switching/setup action, never by GUI/status."""
     h = load_hook()
@@ -1106,29 +1157,20 @@ def ensure_integration(vm=False):
         desired.extend((p, data, 0o644) for p, data in audio_monitor_policy(SETTINGS))
         desired.append((Path(SETTINGS['hook_path']), HOOK, 0o755))
     for path, data, _ in desired:
-        check_managed(path, data, SETTINGS)
+        check_managed(path, data)
     needed = [(p, data, mode) for p, data, mode in desired
-              if not p.exists() or p.read_bytes() != data or str(p) not in SETTINGS.get('managed_files', {})]
+              if not p.exists() or p.read_bytes() != marked(data)]
     if not needed:
         return
     fd = h.lock()
     try:
-        current = json.loads(SETTINGS_PATH.read_text())
-        if current.get('installation_id') != SETTINGS.get('installation_id'):
-            raise Error('Installation changed during setup')
-        SETTINGS.update(current)
         for path, data, mode in needed:
-            check_managed(path, data, SETTINGS)
-            write_file(path, data, mode)
-            SETTINGS.setdefault('managed_files', {})[str(path)] = digest(data)
-        write_file(SETTINGS_PATH, (json.dumps(SETTINGS, indent=2) + '\n').encode())
+            check_managed(path, data)
+            write_file(path, marked(data), mode)
     finally:
         os.close(fd)
-    # Hook discovery refresh happens outside the lock; no daemon restart.
     if any(str(p) == SETTINGS['hook_path'] for p, _, _ in needed):
-        for daemon in ('virtqemud.service', 'libvirtd.service'):
-            if run('/usr/bin/systemctl', 'show', daemon, '-p', 'ActiveState', '--value') == 'active':
-                run('/usr/bin/systemctl', 'kill', '--kill-whom=main', '--signal=HUP', daemon)
+        refresh_hooks()
 
 
 def status_file(uid, job):
@@ -1240,21 +1282,26 @@ def cleanup(args):
     h = load_hook()
     files, directories = redundant_files()
     files.extend(leftover_progress())
-    integrations = dict(SETTINGS.get('managed_files', {}))
-    allowed = {str(CONFIG), SETTINGS['hook_path']}
+    integrations = {}
+    original_mode = None
     suffix = GPU.replace(':', '_').replace('.', '_')
-    allowed.update('/etc/wireplumber/' + folder + '/51-nvidia-handoff-' + suffix + ext
-                   for folder, ext in (('wireplumber.conf.d', '.conf'), ('main.lua.d', '.lua')))
-    for name, expected in integrations.items():
-        if name not in allowed:
-            raise Error('Unrecognized managed path in configuration: ' + name)
-        path = Path(name)
-        if path.exists() or path.is_symlink():
-            validate_root_file(path)
-            if digest(path.read_bytes()) != expected:
-                raise Error('Preserving administrator-modified file: ' + name)
+    candidates = [CONFIG, Path(SETTINGS['hook_path'])]
+    candidates.extend(Path('/etc/wireplumber') / folder / ('51-nvidia-handoff-' + suffix + ext)
+                      for folder, ext in (('wireplumber.conf.d', '.conf'), ('main.lua.d', '.lua')))
+    for path in candidates:
+        if not path.exists() and not path.is_symlink():
+            continue
+        body, original = receipt(path)
+        if original is None:
+            if path != CONFIG:
+                raise Error('Unmarked integration requires explicit installer migration: ' + str(path))
+            continue  # A preexisting user Xorg policy belongs to the user.
+        integrations[str(path)] = digest(path.read_bytes())
+        if path == CONFIG and original != 'absent':
+            original_mode = original
+        else:
             files.append(path)
-    for path in (SETTINGS_PATH, Path('/opt/nvidia-handoff'), Path('/opt/nvidia_handoff_core.py')):
+    for path in (Path('/opt/nvidia-handoff'), Path('/opt/nvidia_handoff_core.py')):
         validate_root_file(path)
         files.append(path)
     if h.STATE_DIR.exists():
@@ -1265,13 +1312,6 @@ def cleanup(args):
             if path.name not in ('lock', 'state.json', 'destination.json', 'xorg-transition', 'uninstalling'):
                 raise Error('Unexpected runtime file: ' + str(path))
             validate_root_file(path)
-    original_mode = SETTINGS.get('xorg_original_mode')
-    if str(CONFIG) not in integrations and CONFIG.exists():
-        validate_root_file(CONFIG)
-        if h.xorg_mode() != SETTINGS.get('xorg_applied_mode', original_mode):
-            raise Error('AutoAddGPU was changed outside NVIDIA handoff; preserving it.')
-        if original_mode not in ('on', 'off'):
-            raise Error('Original Xorg setting is unknown; preserving it. Reinstall this version first.')
     guests = []
     if shutil.which('virsh'):
         for ident in virsh('list', '--all', '--uuid').split():
@@ -1317,13 +1357,12 @@ def cleanup(args):
         for name, expected in integrations.items():
             if Path(name).exists() and digest(Path(name).read_bytes()) != expected:
                 raise Error('Integration changed during cleanup: ' + name)
-        if str(CONFIG) not in integrations and CONFIG.exists() and h.xorg_mode() != original_mode:
+        if original_mode is not None:
+            body, _ = receipt(CONFIG)
             data = re.sub(rb'(?im)^(\s*Option\s+"AutoAddGPU"\s+")(?:on|off)("\s*)$',
-                          lambda m: m[1] + original_mode.encode() + m[2], CONFIG.read_bytes())
-            atomic_config(data)
-        # Delete the installation identity before removing its lock: queued old workers refuse to recreate state.
-        files.remove(SETTINGS_PATH)
-        SETTINGS_PATH.unlink()
+                          lambda m: m[1] + original_mode.encode() + m[2], body)
+            write_file(CONFIG, data, stat.S_IMODE(CONFIG.stat().st_mode))
+        # Removing the program invalidates queued workers before the lock disappears.
         remove_files(files, directories)
         for parent in {Path(name).parent for name in integrations if name.startswith('/etc/wireplumber/')} :
             if parent.exists() and not parent.is_symlink() and not any(parent.iterdir()):
@@ -1340,7 +1379,7 @@ def cleanup(args):
             os.close(fd)
             fd = None
         # Restore VM metadata on a pre-removal failure, outside the GPU lock.
-        if SETTINGS_PATH.exists():
+        if Path('/opt/nvidia-handoff').exists():
             for ident, old, changed in reversed(restored):
                 current = virsh('dumpxml', '--inactive', ident)
                 if ET.tostring(ET.fromstring(current)) == ET.tostring(ET.fromstring(changed)):
@@ -1353,11 +1392,10 @@ def cleanup(args):
 
 
 def install(argv):
-    """Install without changing any driver, guest, desktop or runtime transaction."""
+    """Install code; explicitly migrate a legacy manifest without touching devices."""
     import ast
-    parser = argparse.ArgumentParser(description='Install portable secondary NVIDIA handoff')
+    parser = argparse.ArgumentParser(description='Install stateless secondary NVIDIA handoff')
     parser.add_argument('--gpu', help='PCI BDF when multiple eligible NVIDIA GPUs exist')
-    parser.add_argument('--display-manager', help='Optional systemd display manager unit')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--optional-gpu', action='store_true', help='Enable optional GPU cold boot and hotplug')
     args = parser.parse_args(argv)
@@ -1371,121 +1409,86 @@ def install(argv):
         if not shutil.which(command, path='/usr/sbin:/usr/bin:/sbin:/bin'):
             raise Error('Missing required system command: ' + command)
     config = h.discover(args.gpu)
-    # Detect previous installation by its own source markers, not by machine-specific paths.
-    legacy = []
-    hookdir = Path('/etc/libvirt/hooks/qemu.d')
-    for hook in hookdir.glob('*'):
-        if not hook.is_file() or hook.is_symlink():
-            continue
-        try:
-            text = hook.read_text()
-            if 'def framebuffer_idle(' not in text or 'def choose_target(' not in text:
-                continue
-            values = {}
-            for node in ast.parse(text).body:
-                if isinstance(node, ast.Assign):
-                    value = node.value
-                    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == 'Path' and len(value.args) == 1:
-                        value = value.args[0]
-                    try:
-                        literal = ast.literal_eval(value)
-                        for target in node.targets:
-                            if isinstance(target, ast.Name):
-                                values[target.id] = literal
-                            elif isinstance(target, ast.Tuple) and isinstance(literal, (list, tuple)) and len(target.elts) == len(literal):
-                                for name, part in zip(target.elts, literal):
-                                    if isinstance(name, ast.Name):
-                                        values[name.id] = part
-                    except (ValueError, TypeError):
-                        pass
-            if values.get('GPU') == config['gpu']:
-                legacy.append((hook, values))
-        except (SyntaxError, UnicodeError):
-            continue
-    if SETTINGS_PATH.exists():
-        validate_root_file(SETTINGS_PATH)
-        previous = json.loads(SETTINGS_PATH.read_text())
-        if previous['gpu'] != config['gpu']:
-            raise Error('Another GPU is already configured. Remove/migrate that installation explicitly first.')
-        for key in ('state_dir', 'xorg_config', 'hook_path', 'display_manager', 'installation_id', 'managed_files', 'xorg_original_mode', 'xorg_applied_mode'):
-            if key in previous:
-                config[key] = previous[key]
-    elif legacy:
-        if len(legacy) != 1:
-            raise Error('Multiple legacy hooks match GPU; resolve duplicate hooks first.')
-        hook, values = legacy[0]
-        config.update(state_dir=values['STATE_DIR'], xorg_config=values['XORG_CONFIG'], hook_path=str(hook))
-    if args.display_manager:
-        if not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', args.display_manager):
-            raise Error('Invalid display manager unit')
-        config['display_manager'] = args.display_manager
+    config['hook_path'] = str(hook_path())
+    previous = None
+    migration = []
+    if LEGACY_CONFIG.exists() or LEGACY_CONFIG.is_symlink():
+        validate_root_file(LEGACY_CONFIG)
+        previous = json.loads(LEGACY_CONFIG.read_text())
+        identity = lambda c: {(d['bdf'], d['vendor'], d['device']) for d in c['devices']}
+        if previous['gpu'] != config['gpu'] or identity(previous) != identity(config):
+            raise Error('Legacy manifest belongs to different hardware; refusing migration')
+        runtime = Path(previous['state_dir'])
+        if not (str(runtime) == '/run/nvidia-handoff/' + config['gpu'] or
+                runtime.parent == Path('/run') and re.fullmatch(r'[A-Za-z0-9_-]+-gpu-handoff', runtime.name)):
+            raise Error('Unrecognized legacy runtime directory')
+        if previous['xorg_config'] != config['xorg_config'] or previous['hook_path'] != config['hook_path']:
+            raise Error('Legacy integration paths differ from live discovery; review before migration')
+        config['state_dir'] = str(runtime)
+        suffix = config['gpu'].replace(':', '_').replace('.', '_')
+        allowed = {config['hook_path'], config['xorg_config']}
+        allowed.update('/etc/wireplumber/' + folder + '/51-nvidia-handoff-' + suffix + ext
+                       for folder, ext in (('wireplumber.conf.d', '.conf'), ('main.lua.d', '.lua')))
+        for name, expected in previous.get('managed_files', {}).items():
+            if name not in allowed:
+                raise Error('Unrecognized legacy managed path: ' + name)
+            path = Path(name)
+            if path.exists() or path.is_symlink():
+                validate_root_file(path)
+                body = path.read_bytes()
+                if digest(body) != expected:
+                    raise Error('Preserving administrator-modified file: ' + name)
+                migration.append((path, marked(body), stat.S_IMODE(path.stat().st_mode)))
+        xorg = Path(config['xorg_config'])
+        if xorg.exists() and str(xorg) not in previous.get('managed_files', {}):
+            validate_root_file(xorg)
+            modes = re.findall(rb'(?im)^\s*Option\s+"AutoAddGPU"\s+"(off|on)"\s*$', xorg.read_bytes())
+            original = previous.get('xorg_original_mode')
+            if len(modes) != 1 or modes[0].decode().lower() != previous.get('xorg_applied_mode') or original not in ('off', 'on'):
+                raise Error('Legacy Xorg restoration record does not match live policy')
+            migration.append((xorg, marked(xorg.read_bytes(), original), stat.S_IMODE(xorg.stat().st_mode)))
     h.configure(config)
     h.topology()
-    h.load()  # Validate retained runtime state, do not recover/rebind it.
-    xorg = Path(config['xorg_config'])
-    if xorg.exists():
-        validate_root_file(xorg)
-        h.xorg_mode()
-    else:
-        # Avoid overriding administrator flags unknowingly.
-        files = [Path('/etc/X11/xorg.conf'), *Path('/etc/X11/xorg.conf.d').glob('*.conf')]
-        if any(p.exists() and re.search(r'^\s*Option\s+"AutoAddGPU"', p.read_text(), re.I | re.M) for p in files):
-            raise Error('Existing AutoAddGPU configuration found; select/migrate it explicitly before installing.')
-    config.setdefault('installation_id', str(uuid.uuid4()))
-    config.setdefault('managed_files', {})
-    config.setdefault('xorg_original_mode', h.xorg_mode() if xorg.exists() else None)
-    config.setdefault('xorg_applied_mode', h.xorg_mode() if xorg.exists() else 'off')
-    integration = args.optional_gpu or Path(config['hook_path']).exists()
-    audio_policy = audio_monitor_policy(config) if integration else []
-    print(json.dumps(config, indent=2), flush=True)
-    for path, _ in audio_policy:
-        print('NVIDIA HDMI audio policy: ' + str(path), flush=True)
+    h.load()  # Validate active recovery state without recovering or rebinding.
+    print('Live hardware and integration discovery:\n' + json.dumps(config, indent=2), flush=True)
+    print('Install /opt/nvidia-handoff and /opt/nvidia_handoff_core.py.', flush=True)
+    for path, _, _ in migration:
+        print('Add ownership/restoration receipt: ' + str(path), flush=True)
+    if previous:
+        print('Remove legacy manifest: ' + str(LEGACY_CONFIG), flush=True)
+        if h.STATE_DIR.exists():
+            print('Tag existing GPU lock: ' + str(h.STATE_DIR / 'lock'), flush=True)
     if args.dry_run:
         return
-    # A private root state lock serializes hook replacement, preserving an active VM transaction.
-    fd = h.lock(installing=True) if h.STATE_DIR.exists() else None
+    source = Path(__file__).resolve()
+    core = source.with_name('nvidia_handoff_core.py').read_bytes()
+    app = source.read_bytes()
+    ast.parse(core); ast.parse(app)
+    expected_migration = {path: digest(path.read_bytes()) for path, _, _ in migration}
     changes = []
-    def put(path, data, mode):
-        old = None
-        if path.exists() or path.is_symlink():
-            validate_root_file(path)
-            old = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-        changes.append((path, old))
-        write_file(path, data, mode)
+    fd = h.lock(installing=True) if h.STATE_DIR.exists() else None
     try:
-        source = Path(__file__).resolve()
-        # Hook wrapper is replaced last, so every new invocation sees complete installed files.
-        core = source.with_name('nvidia_handoff_core.py').read_bytes()
-        ast.parse(core)
-        app = source.read_bytes();ast.parse(app)
-        put(Path('/opt/nvidia_handoff_core.py'), core, 0o644)
-        put(Path('/opt/nvidia-handoff'), app, 0o755)
-        if integration and not xorg.exists():
-            data = XORG_OFF
-            put(xorg, data, 0o644)
-            config['managed_files'][str(xorg)] = digest(data)
-        for path, data in audio_policy:
-            check_managed(path, data, config)
-            put(path, data, 0o644)
-            config['managed_files'][str(path)] = digest(data)
-        if integration and shutil.which('virsh'):
-            hook = Path(config['hook_path'])
-            existed = hook.exists()
-            check_managed(hook, HOOK, config)
-            put(hook, HOOK, 0o755)
-            config['managed_files'][str(hook)] = digest(HOOK)
-            if not existed:
-                # Refresh hook discovery only; never restart libvirt/QEMU or the desktop.
-                for daemon in ('virtqemud.service', 'libvirtd.service'):
-                    state = h.run('/usr/bin/systemctl', 'show', daemon, '-p', 'ActiveState', '--value')
-                    if state == 'active':
-                        h.run('/usr/bin/systemctl', 'kill', '--kill-whom=main', '--signal=HUP', daemon)
-        put(SETTINGS_PATH, (json.dumps(config, indent=2)+'\n').encode(), 0o644)
-        print('Installed. No GPU bindings, running guests or graphical sessions changed.', flush=True)
-        if audio_policy:
-            print('Restart WirePlumber in each logged-in desktop session or log in again to apply the HDMI audio policy. A restart may briefly interrupt host sound.', flush=True)
+        if previous and json.loads(LEGACY_CONFIG.read_text()) != previous:
+            raise Error('Legacy manifest changed during migration')
+        for path, expected in expected_migration.items():
+            validate_root_file(path)
+            if digest(path.read_bytes()) != expected:
+                raise Error('Integration changed during migration: ' + str(path))
+        targets = [(Path('/opt/nvidia_handoff_core.py'), core, 0o644),
+                   (Path('/opt/nvidia-handoff'), app, 0o755), *migration]
+        for path, data, mode in targets:
+            old = None
+            if path.exists() or path.is_symlink():
+                validate_root_file(path)
+                old = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+            changes.append((path, old))
+            write_file(path, data, mode)
+        if previous:
+            # Remove only the exact manifest that was reviewed before acquiring the lock.
+            if json.loads(LEGACY_CONFIG.read_text()) != previous:
+                raise Error('Legacy manifest changed during migration')
+            LEGACY_CONFIG.unlink()
     except BaseException:
-        # Restore files in reverse order, retaining runtime state throughout.
         for path, old in reversed(changes):
             if old is None:
                 path.unlink(missing_ok=True)
@@ -1495,8 +1498,22 @@ def install(argv):
     finally:
         if fd is not None:
             os.close(fd)
+    print('Installed. No GPU bindings, running guests or graphical sessions changed.', flush=True)
     if args.optional_gpu:
-        print(run('/usr/bin/python3', '-I', '/opt/nvidia-handoff', 'enable-optional'), flush=True)
+        print(run('/usr/bin/python3', '-I', '/opt/nvidia-handoff', '--gpu', config['gpu'], 'enable-optional'), flush=True)
+
+
+def hook_gpu(h, xml):
+    root = ET.fromstring(xml)
+    slots = set()
+    for a in root.findall('./devices/hostdev[@type="pci"]/source/address'):
+        bdf = '%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function'))
+        slots.add(bdf.rsplit('.', 1)[0])
+    candidates = [p.name for p in h.pci_gpu_devices()
+                  if p.name.rsplit('.', 1)[0] in slots and h.read_attr(p / 'vendor') == '0x10de']
+    if len(candidates) > 1:
+        raise Error('More than one NVIDIA GPU in hook XML; refusing ambiguous handoff')
+    return candidates[0] if candidates else None
 
 
 def main(argv):
@@ -1507,14 +1524,34 @@ def main(argv):
         h.assert_x11()
         print(json.dumps(h.discover(argv[1] if len(argv) > 1 else None), indent=2))
         return
-    initialize()
+    gpu = manager = None
+    while argv and argv[0] in ('--gpu', '--display-manager'):
+        if len(argv) < 2:
+            raise Error('Missing value for ' + argv[0])
+        if argv[0] == '--gpu':
+            gpu = argv[1]
+        else:
+            manager = argv[1]
+            if not re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', manager):
+                raise Error('Invalid display manager unit')
+        argv = argv[2:]
+    if argv[:1] == ['--libvirt-hook']:
+        args = argv[1:]
+        if len(args) < 4 or tuple(args[1:3]) not in (('prepare', 'begin'), ('release', 'end')):
+            return 0
+        xml = sys.stdin.read()
+        h = load_core()
+        gpu = hook_gpu(h, xml)
+        if gpu is None:
+            return 0
+        initialize(gpu)
+        return load_hook().main(args, xml)
+    initialize(gpu, manager)
     if argv[:1] == ['--cleanup']:
         parser = argparse.ArgumentParser(description='Remove NVIDIA handoff and restore its integration changes')
         parser.add_argument('--dry-run', action='store_true', help='Show files, VM restoration and blockers without changing anything')
         parser.add_argument('--yes', action='store_true', help='Confirm full removal')
         return cleanup(parser.parse_args(argv[1:]))
-    if argv[:1] == ['--libvirt-hook']:
-        return load_hook().main(argv[1:])
     if argv[:1] == ['enable-optional']:
         return enable_optional_guests()
     if argv[:1] == ['start-vm']:

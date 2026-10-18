@@ -8,7 +8,7 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 - **Optional VM passthrough:** start a VM with or without the GPU; ordinary VM starts are GPU-free after setup.
 - **Live attachment:** connect the GPU and its associated PCI functions to a prepared running VM without restarting it.
 - **Per-run assignment:** a VM keeps the GPU until it powers off; its next ordinary start is GPU-free.
-- **Automatic discovery:** detect the secondary GPU, its PCI functions, IOMMU groups, VM definitions, and display manager.
+- **Stateless discovery:** detect the secondary GPU, PCI functions, native drivers, IOMMU groups, VM definitions, live ownership, Xorg policy, and display manager without a hardware/status configuration file.
 - **Desktop GUI:** view the current destination, VM state, and complete or partial attachments; supports desktop fonts and high DPI.
 - **Safety checks:** detect busy devices and active displays, roll back partial host detach, and retain recovery state after incomplete operations.
 - **Cleanup:** preview or remove the installed application and its integration from the GUI or CLI.
@@ -21,7 +21,7 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 - Tkinter for the GUI; `lspci`, kmod tools, `udevadm`, systemd tools, and `pkexec` with a desktop authentication agent.
 - For VM passthrough: libvirt, `virsh`, `qemu:///system`, isolated IOMMU groups, and suitable guest PCIe ports. Live attachment also requires guest OS and driver hotplug support.
 
-Each installation manages one selected GPU and its associated NVIDIA PCI functions, including HDMI audio and any GPU USB controllers. The display manager is detected automatically, with an optional override. GPU and guest compatibility varies by configuration.
+Each operation manages one selected GPU and its associated NVIDIA PCI functions, including HDMI audio and any GPU USB controllers. The display manager is detected automatically, with a per-command override. GPU and guest compatibility varies by configuration.
 
 ## Installation
 
@@ -40,9 +40,16 @@ Install:
 sudo /usr/bin/python3 -I ./nvidia-handoff --install
 ```
 
-The installer places both program files in `/opt` and writes `/etc/nvidia-handoff.json`. Installation preserves running VM hardware, GPU bindings, and graphical sessions. Use the installed copy for normal operation.
+A fresh installation places only the two program files in `/opt`; it creates no hardware/status configuration file or runtime directory. Installation preserves running VM hardware, GPU bindings, and graphical sessions. Use the installed copy for normal operation.
 
-For multiple eligible GPUs, use `--probe BDF` to inspect one and `--install --gpu BDF` to select it. Use `--display-manager UNIT.service` with `--install` to override display-manager detection.
+For multiple eligible GPUs, use `--probe BDF` to inspect one and `--install --gpu BDF` to preview/install for that hardware. Supply `--gpu BDF` before the operation on subsequent commands; selection is not saved. Use `--display-manager UNIT.service` before an operation to override display-manager detection for that command and its workers.
+
+```sh
+/opt/nvidia-handoff --gpu 0000:02:00.0 --gui
+sudo /opt/nvidia-handoff --gpu 0000:02:00.0 --display-manager example.service connect --restart-session
+```
+
+To migrate an existing installation, run the same `--install --dry-run` and `--install` commands from the updated source. The installer validates `/etc/nvidia-handoff.json` against live hardware, transfers file ownership and original Xorg policy records into comments in existing integration files, and removes the JSON only after successful installation. It preserves existing recovery transactions and lock locations. Review the preview and authorize the listed system paths before applying it.
 
 ## GUI
 
@@ -117,7 +124,6 @@ Fresh boot requires any managed save state to be resumed or removed explicitly i
 | Location | Purpose |
 | --- | --- |
 | `/opt/nvidia-handoff`, `/opt/nvidia_handoff_core.py` | Program files |
-| `/etc/nvidia-handoff.json` | Hardware selection and integration settings |
 | `/etc/libvirt/hooks/qemu.d/50-nvidia-handoff` | VM lifecycle integration |
 | `/etc/X11/xorg.conf.d/90-nvidia-handoff.conf` | Xorg GPU policy |
 | `/etc/wireplumber/wireplumber.conf.d/51-nvidia-handoff-*.conf` | Selected HDMI audio policy on WirePlumber 0.5+ |
@@ -125,7 +131,7 @@ Fresh boot requires any managed save state to be resumed or removed explicitly i
 | `/run/nvidia-handoff/<BDF>/` | Locking, recovery state, and destination policy |
 | `/run/user/<UID>/nvidia-handoff-<JOB_UUID>.json` | GUI operation progress |
 
-Integration files are created for the relevant setup or switching action. These are default paths; migrated installations retain the paths in their configuration. GUI refresh and status inspection are read-only. Switching jobs run in a transient systemd unit.
+Integration files are created for the relevant setup or switching action. These are default paths; existing Xorg policies, owned hooks, and migrated recovery directories are discovered in place. Integration comments contain content hashes and the original Xorg setting for safe cleanup; they do not cache hardware or ownership status. GUI refresh and status inspection are read-only. Current attachment comes from live VM definitions, device bindings, and X11 state. Temporary locks, rollback records, and destination policy under `/run` protect handoffs; they are not a replacement hardware/status database. Switching jobs run in a transient systemd unit.
 
 The WirePlumber policy excludes the selected displayless GPU's HDMI audio from host audio monitoring. Apply a new policy by logging in again or restarting WirePlumber in the affected session; the latter can briefly interrupt sound.
 
@@ -146,3 +152,13 @@ Cleanup requires an idle GPU and no active transition. It restores host GPU bind
 sudo journalctl -t nvidia-handoff
 sudo journalctl -u nvidia-handoff.service
 ```
+
+## Verification
+
+Run isolated regression checks from the source directory:
+
+```sh
+/usr/bin/python3 -I ./test_stateless.py
+```
+
+Tests use synthetic devices and integration files inside the checkout. They do not change host drivers, services, or VMs.

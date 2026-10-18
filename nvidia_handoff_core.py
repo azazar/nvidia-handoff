@@ -19,7 +19,6 @@ import uuid
 import xml.etree.ElementTree as ET
 
 SETTINGS = {}
-CONFIG_FILE = Path('/etc/nvidia-handoff.json')
 VM = UUID = GPU = AUDIO = None
 DEVICES = ()
 HOST = IDS = MODULE_ALIASES = {}
@@ -494,14 +493,15 @@ def lock(installing=False, cleaning=False):
     if os.geteuid() != 0:
         raise Refuse('Root required for full /proc visibility and device control')
     def installed():
-        if installing or not SETTINGS.get('installation_id'):
+        if installing:
             return
-        try:
-            current = json.loads(CONFIG_FILE.read_text())
-        except FileNotFoundError:
-            raise Refuse('The application has been removed; close this process')
-        if current.get('installation_id') != SETTINGS['installation_id']:
-            raise Refuse('Installation changed; close this process and retry')
+        for name, expected in SETTINGS.get('program_identity', {}).items():
+            try:
+                st = Path(name).lstat()
+            except FileNotFoundError:
+                raise Refuse('The application has been removed; close this process')
+            if (st.st_dev, st.st_ino, st.st_mtime_ns) != tuple(expected):
+                raise Refuse('Installation changed; close this process and retry')
     installed()  # Never recreate runtime files after an uninstall.
     os.umask(0o077)
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -515,10 +515,20 @@ def lock(installing=False, cleaning=False):
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 installed()
-                if os.fstat(fd).st_nlink == 0:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o077:
+                    raise Refuse('Unsafe runtime lock ownership/permissions')
+                if st.st_nlink == 0:
                     raise Refuse('Handoff lock was removed; retry with the installed application')
                 if not cleaning and (STATE_DIR / 'uninstalling').exists():
                     raise Refuse('Full cleanup is in progress')
+                tag = ('nvidia-handoff ' + GPU + '\n').encode()
+                current = os.pread(fd, 128, 0)
+                if current not in (b'', tag):
+                    raise Refuse('Runtime lock belongs to another GPU')
+                if not current:
+                    os.pwrite(fd, tag, 0)
+                    os.fsync(fd)
                 return fd
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -612,13 +622,13 @@ def boot_xml(xml, with_gpu):
 
 
 
-def main(argv):
+def main(argv, xml=None):
     global VM, UUID
     # Ignore reconnect unconditionally: failure there can cause libvirt to kill QEMU.
     if len(argv) >= 4:
         if tuple(argv[1:3]) not in (('prepare', 'begin'), ('release', 'end')):
             return 0
-        xml = sys.stdin.read()
+        xml = sys.stdin.read() if xml is None else xml
         root = ET.fromstring(xml)
         addresses = root.findall('./devices/hostdev[@type="pci"]/source/address')
         related = any('%04x:%02x:%02x.%x' % tuple(int(a.get(k, '0'), 0) for k in ('domain', 'bus', 'slot', 'function')) in DEVICES for a in addresses)
@@ -703,6 +713,62 @@ def native_driver(p):
     raise Refuse('Cannot infer native driver for ' + p.name + '; configure it while host-bound')
 
 
+def xorg_path():
+    candidates = []
+    for path in [Path('/etc/X11/xorg.conf'), *Path('/etc/X11/xorg.conf.d').glob('*.conf')]:
+        if not path.exists():
+            continue
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise Refuse('Unsafe Xorg configuration: ' + str(path))
+        data = path.read_bytes()
+        if re.search(rb'(?im)^\s*Option\s+"AutoAddGPU"', data) or b'nvidia-handoff sha256=' in data:
+            candidates.append(path)
+    if len(candidates) > 1:
+        raise Refuse('Multiple AutoAddGPU policies found; resolve them before switching')
+    return str(candidates[0] if candidates else Path('/etc/X11/xorg.conf.d/90-nvidia-handoff.conf'))
+
+
+def runtime_path(gpu, devices):
+    default = Path('/run/nvidia-handoff') / gpu
+    candidates = []
+    for directory in [default, *Path('/run').glob('*-gpu-handoff')]:
+        try:
+            if not directory.exists():
+                continue
+            st = directory.lstat()
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o700:
+                raise Refuse('Unsafe runtime directory: ' + str(directory))
+            lockfile = directory / 'lock'
+            tag = b''
+            if lockfile.exists():
+                fd = os.open(lockfile, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o077:
+                        raise Refuse('Unsafe runtime lock: ' + str(lockfile))
+                    tag = os.read(fd, 128)
+                finally:
+                    os.close(fd)
+            state = directory / 'state.json'
+            matches = False
+            if state.exists():
+                fd = os.open(state, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd) as source:
+                    st = os.fstat(source.fileno())
+                    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o077:
+                        raise Refuse('Unsafe recovery state: ' + str(state))
+                    value = json.load(source)
+                matches = set(value.get('host', {}).get('drivers', {})) == set(devices)
+            if tag == ('nvidia-handoff ' + gpu + '\n').encode() or matches:
+                candidates.append(directory)
+        except PermissionError:
+            continue  # Unprivileged inventory does not need private transaction state.
+    if len(candidates) > 1:
+        raise Refuse('Multiple recovery directories match this GPU; refusing parallel locks')
+    return str(candidates[0] if candidates else default)
+
+
 def discover(gpu=None):
     candidates = [p for p in pci_gpu_devices() if read_attr(p / 'vendor') == '0x10de'
                   and read_attr(p / 'boot_vga', '0') != '1' and not attached_display(p.name)]
@@ -730,8 +796,8 @@ def discover(gpu=None):
     except (Refuse, OSError, ValueError):
         pass
     return {'version': 2, 'gpu': selected.name, 'devices': devices, 'label': label,
-            'state_dir': '/run/nvidia-handoff/' + selected.name,
-            'xorg_config': '/etc/X11/xorg.conf.d/90-nvidia-handoff.conf',
+            'state_dir': runtime_path(selected.name, [d['bdf'] for d in devices]),
+            'xorg_config': xorg_path(),
             'display_manager': None, 'hook_path': '/etc/libvirt/hooks/qemu.d/50-nvidia-handoff'}
 
 
