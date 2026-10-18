@@ -12,7 +12,8 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 - **Live attachment:** connect the GPU and its associated PCI functions to a prepared running VM without restarting it.
 - **Per-run assignment:** a VM keeps the GPU until it powers off; its next ordinary start is GPU-free.
 - **Stateless discovery:** detect the secondary GPU, PCI functions, native drivers, IOMMU groups, VM definitions, live ownership, Xorg policy, and display manager without a hardware/status configuration file.
-- **Desktop GUI:** view the current destination, VM state, and complete or partial attachments; supports desktop fonts and high DPI.
+- **Desktop GUI:** view the current destination, VM state, complete or partial attachments, and verified-driver tags; supports desktop fonts and high DPI.
+- **Quick connections:** ready VMs with verified drivers skip the ordinary Connect confirmation. Disruptive actions still require confirmation.
 - **Safety checks:** detect busy devices and active displays, roll back partial host detach, and retain recovery state after incomplete operations.
 - **Cleanup:** preview or remove the installed application and its integration from the GUI or CLI.
 
@@ -70,7 +71,7 @@ Open from your normal X11 session:
 | Xorg | Enable NVIDIA PRIME for host games |
 | A VM | Prepare and connect the GPU; install missing Debian drivers |
 
-Prepared VMs are listed before unprepared VMs. Unsupported VM architectures or transient definitions remain visible with an explanation. Select a destination and click **Connect**. Ready VMs get a short connection confirmation without preparation warnings. The resizable confirmation wraps and scrolls its text while keeping action buttons visible. Driver installation is a separate checkbox, off by default for prepared VMs. The button is disabled for an already active destination with a working driver, or while an operation is in progress. If a connected guest’s NVIDIA driver is unavailable or cannot be verified, Connect remains available to finish Debian setup. Partial VM attachments can be completed through the same action.
+Prepared VMs are listed before unprepared VMs. Unsupported VM architectures or transient definitions remain visible with an explanation. Select a destination and click **Connect**. Ready VMs with a successful driver-verification tag, or a successful live driver check, skip the ordinary connection confirmation. Other ready VMs get a short confirmation without preparation warnings. A conflicting live driver check, missing preparation, planned VM shutdown, or desktop restart keeps confirmation enabled. The resizable confirmation wraps and scrolls its text while keeping action buttons visible. Driver installation is a separate checkbox, off by default for prepared VMs. The button is disabled for an already active destination with a working driver, or while an operation is in progress. If a connected guest’s NVIDIA driver is unavailable or cannot be verified, Connect remains available to finish Debian setup. Partial VM attachments can be completed through the same action.
 
 **Start without GPU** starts a selected shut-off VM with GPU-free startup settings. **Refresh** updates ownership and VM status. **Full cleanup…** opens application removal.
 
@@ -84,7 +85,7 @@ A running VM with available PCI capacity receives the GPU live. If it needs new 
 
 The guest agent identifies the actual operating system before package changes. Automatic driver setup supports Debian 12 and 13 amd64 only. A working driver for the selected GPU is left untouched. Otherwise, the script installs matching kernel headers, adds NVIDIA's signed APT repository using its official keyring package when needed, and uses NVIDIA's driver assistant to select the appropriate driver packages. Missing Debian contrib/non-free components are enabled in a separate APT source without overwriting existing source files. Package changes are simulated first and package removal is refused.
 
-The setup confirmation authorizes these guest package changes, the NVIDIA driver license, and one graceful guest reboot if the new driver cannot initialize immediately. Driver readiness is checked again after reboot. Failures retain the GPU assignment and report what still needs attention. A missing agent, unsupported guest OS, network/package failure, or required Secure Boot enrollment is reported rather than treated as success.
+The setup confirmation authorizes these guest package changes, the NVIDIA driver license, and one graceful guest reboot if the new driver cannot initialize immediately. Driver readiness is checked again after reboot. Successful verification adds `driver-verified="yes"` to the existing optional-GPU metadata in the inactive VM definition. This records completed setup, not current GPU ownership; a failed live check overrides the tag. The tag appears as **drivers verified** in the VM list and is removed with the handoff metadata during cleanup. Administrator authentication remains required when applicable. Failures retain the GPU assignment and report what still needs attention. A missing agent, unsupported guest OS, network/package failure, or required Secure Boot enrollment is reported rather than treated as success.
 
 See [NVIDIA's Debian installation guide](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/debian.html), [driver assistant](https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/driver-assistant.html), and [libvirt PCI hotplug](https://www.libvirt.org/pci-hotplug.html).
 

@@ -343,17 +343,32 @@ def enable_optional_guests():
         print('Enabled optional GPU for ' + ET.fromstring(xml).findtext('name'), flush=True)
 
 
-def prepare_vm_definition(ident):
-    h = load_hook()
+def update_vm_definition(ident, transform):
     if not re.search(r'^Persistent:\s+yes$', virsh('dominfo', ident), re.M):
         raise Error('Automatic preparation requires a persistent VM')
     old = virsh('dumpxml', '--inactive', ident)
-    changed = h.prepare_guest_xml(old)
+    changed = transform(old)
     if ET.tostring(ET.fromstring(old)) == ET.tostring(ET.fromstring(changed)):
         return
     if ET.tostring(ET.fromstring(virsh('dumpxml', '--inactive', ident))) != ET.tostring(ET.fromstring(old)):
         raise Error('VM definition changed during preparation; retry')
     virsh_input(changed, 'define', '/dev/stdin', '--validate')
+
+
+def prepare_vm_definition(ident):
+    update_vm_definition(ident, load_hook().prepare_guest_xml)
+
+
+def tag_guest_driver(ident):
+    """Record a completed verification, never a cached current attachment."""
+    h = load_hook()
+    def changed(xml):
+        root = ET.fromstring(xml)
+        if not h.optional_devices(root):
+            raise Error('Cannot tag a VM without validated optional GPU metadata')
+        root.find('./metadata/{' + h.OPTIONAL_NS + '}gpu').set('driver-verified', 'yes')
+        return ET.tostring(root, encoding='unicode')
+    update_vm_definition(ident, changed)
 
 
 def guest_agent(ident, command, arguments=None):
@@ -464,6 +479,7 @@ def setup_guest_driver(ident, job, target):
     h = load_hook()
     version = debian_guest(ident, wait=True)
     if guest_driver_ready(ident):
+        tag_guest_driver(ident)
         return 'Debian NVIDIA driver is ready.'
     operation_status(h, job, 'running', 'Installing Debian guest NVIDIA driver packages; this may take several minutes…', target)
     code, output = guest_exec(ident, '/bin/sh', ['-c', GUEST_BOOTSTRAP, 'nvidia-handoff', version], timeout=1800)
@@ -479,6 +495,7 @@ def setup_guest_driver(ident, job, target):
         if code:
             raise Error('GPU remains attached; guest package operation failed: ' + output[-4000:])
     if guest_driver_ready(ident):
+        tag_guest_driver(ident)
         return 'Debian NVIDIA driver installed and ready.'
     code, old_boot = guest_exec(ident, '/bin/cat', ['/proc/sys/kernel/random/boot_id'])
     if code or not re.fullmatch(r'[0-9a-f-]{36}\s*', old_boot):
@@ -491,6 +508,7 @@ def setup_guest_driver(ident, job, target):
         try:
             code, boot = guest_exec(ident, '/bin/cat', ['/proc/sys/kernel/random/boot_id'])
             if not code and boot.strip() != old_boot.strip() and guest_driver_ready(ident):
+                tag_guest_driver(ident)
                 return 'Debian NVIDIA driver ready after guest reboot.'
         except Error:
             pass
@@ -662,7 +680,10 @@ def inventory(check_drivers=False):
                          (h.hotplug_capacity(live_root) < missing or not h.agent_channel(live_root)))
         driver_ready = (guest_driver_ready(ident) if check_drivers and state == 'running' and
                         {e[0] for e in live if e[0] in BDFS} == set(BDFS) else None)
+        group = root.find('./metadata/{' + h.OPTIONAL_NS + '}gpu') if h is not None else None
+        driver_tagged = bool(optional and group is not None and group.get('driver-verified') == 'yes')
         result.append({'uuid': ident, 'name': root.findtext('name'), 'state': state, 'driver_ready': driver_ready,
+                       'driver_tagged': driver_tagged,
                        'optional': bool(optional), 'prepared': prepared, 'persistent': persistent,
                        'startup_gpu': any(bdf in BDFS for bdf, _ in entries), 'pci': bool(entries or optional),
                        'eligible': supported, 'needs_restart': needs_restart,
@@ -684,6 +705,8 @@ def destination_rows(records):
             info += f' · GPU partial ({len(live_gpu)}/{len(BDFS)})'
         else:
             info += ' · no GPU'
+        if d.get('driver_tagged') and d.get('driver_ready') is not False:
+            info += ' · drivers verified'
         if d.get('driver_ready') is False:
             info += '; Debian driver setup needs checking'
         if not d['eligible']:
@@ -936,6 +959,14 @@ def row_summary(row, current=None):
     return row[3]
 
 
+def skip_switch_confirmation(record, stops, restart):
+    return bool(record and record.get('prepared', record.get('optional', False)) and
+                (record.get('driver_tagged') or record.get('driver_ready') is True) and
+                record.get('driver_ready') is not False and not stops and not restart and
+                not record.get('needs_restart') and not record.get('startup_gpu') and
+                record['state'] in ('running', 'shut off'))
+
+
 def switch_confirmation(label, selected, stops, restart, install_driver):
     lines = ['Connect GPU to ' + label + '.']
     if selected:
@@ -947,7 +978,7 @@ def switch_confirmation(label, selected, stops, restart, install_driver):
         if install_driver:
             lines.append('Verify Debian 12/13 through the guest agent. Install NVIDIA drivers only if missing, '
                          'using the signed NVIDIA APT repository if needed. This accepts the NVIDIA driver license '
-                         'and permits one graceful guest reboot.')
+                         'and permits one graceful guest reboot. Save successful driver verification in this VM’s metadata.')
             lines.append('Guest package changes: /etc/apt, /usr, /lib, /boot, /var, /run and /tmp.')
     if stops:
         lines.append('Gracefully shut down: ' + ', '.join(d['name'] for d in stops) + '.')
@@ -1199,11 +1230,13 @@ class GPUWindow:
         record = self.selected_vm()
         needs_preparation = bool(record and not record.get('prepared', record.get('optional', False)))
         offer_driver = bool(record and record.get('driver_ready') is not True)
-        confirmed, install_driver = SwitchDialog(self.root,
-            lambda install: switch_confirmation(label, record, stops, restart, install),
-            offer_driver=offer_driver, default_driver=needs_preparation).show()
-        if not confirmed:
-            return
+        install_driver = False
+        if not skip_switch_confirmation(record, stops, restart):
+            confirmed, install_driver = SwitchDialog(self.root,
+                lambda install: switch_confirmation(label, record, stops, restart, install),
+                offer_driver=offer_driver, default_driver=needs_preparation).show()
+            if not confirmed:
+                return
         self.job = str(uuid.uuid4())
         args = ['/usr/bin/pkexec', '--disable-internal-agent', *program_command('select', target, '--job-id', self.job)]
         if needs_preparation:

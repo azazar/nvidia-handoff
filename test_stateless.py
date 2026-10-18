@@ -25,6 +25,7 @@ class StatelessTests(unittest.TestCase):
     def setUp(self):
         self.core = module('nvidia_handoff_core.py')
         self.app = module('nvidia-handoff')
+        self.app.tag_guest_driver = Mock()
         self.tmp = tempfile.TemporaryDirectory(prefix='.test-', dir=ROOT)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -527,6 +528,7 @@ class StatelessTests(unittest.TestCase):
         with self.assertRaisesRegex(self.app.Error,'GPU remains attached'):
             self.app.setup_guest_driver('vm','job','vm')
         self.app.virsh.assert_not_called()
+        self.app.tag_guest_driver.assert_not_called()
 
     def test_driver_packages_are_simulated_and_cannot_remove_packages(self):
         self.app.load_hook=Mock()
@@ -757,6 +759,58 @@ class StatelessTests(unittest.TestCase):
                 self.assertGreater(dialog.text.yview()[0],0)
                 dialog.cancel()
                 root.update()
+
+
+    def test_verified_tag_skips_only_safe_connect_confirmation(self):
+        d=dict(state='shut off',prepared=True,driver_tagged=True,driver_ready=None)
+        self.assertTrue(self.app.skip_switch_confirmation(d,[],False))
+        for changes in ({'prepared':False},{'driver_ready':False},{'needs_restart':True},
+                        {'startup_gpu':True},{'state':'paused'}):
+            with self.subTest(changes=changes):
+                self.assertFalse(self.app.skip_switch_confirmation({**d,**changes},[],False))
+        self.assertFalse(self.app.skip_switch_confirmation(d,[{'name':'other'}],False))
+        self.assertFalse(self.app.skip_switch_confirmation(d,[],True))
+        self.assertFalse(self.app.skip_switch_confirmation({**d,'driver_tagged':False},[],False))
+
+    def test_guest_driver_tag_updates_only_existing_namespaced_metadata(self):
+        self.configure_guest_devices()
+        app=module('nvidia-handoff')
+        app.load_hook=lambda:self.core
+        xml=self.core.prepare_guest_xml(self.guest_xml())
+        app.virsh=Mock(side_effect=['Persistent: yes',xml,xml])
+        app.virsh_input=Mock()
+        app.tag_guest_driver('vm')
+        changed=app.virsh_input.call_args.args[0]
+        root=app.ET.fromstring(changed)
+        self.assertEqual(root.find('./metadata/{'+self.core.OPTIONAL_NS+'}gpu').get('driver-verified'),'yes')
+        self.assertEqual(root.findall('./devices/hostdev'),[])
+        before=app.ET.fromstring(xml)
+        self.assertEqual(app.ET.tostring(before.find('devices')),app.ET.tostring(root.find('devices')))
+        clean=self.core.disable_optional_xml(changed)
+        self.assertNotIn('driver-verified',clean)
+
+    def test_successful_guest_setup_records_tag_but_failed_setup_does_not(self):
+        self.app.load_hook=Mock()
+        self.app.debian_guest=Mock(return_value='13')
+        self.app.guest_driver_ready=Mock(return_value=True)
+        self.app.setup_guest_driver('vm','job','vm')
+        self.app.tag_guest_driver.assert_called_once_with('vm')
+
+    def test_tagged_ready_vm_dispatches_without_confirmation_or_driver_setup(self):
+        self.configure_guest_devices()
+        record=dict(uuid='vm',name='ready',state='shut off',eligible=True,prepared=True,
+                    optional=True,live_gpu=[],driver_ready=None,driver_tagged=True)
+        window=types.SimpleNamespace(tree=Mock(),busy=False,current_target='cuda',records=[record],
+            attached=False,rows={'vm':('vm','ready','Virtual machine','',True)},
+            root=Mock(),selected_vm=lambda:record,progress=Mock(),update_button=Mock())
+        window.tree.selection.return_value=('vm',)
+        self.app.SwitchDialog=Mock(side_effect=AssertionError('dialog must be skipped'))
+        self.app.subprocess.Popen=Mock()
+        self.app.GPUWindow.apply(window)
+        args=self.app.subprocess.Popen.call_args.args[0]
+        self.assertNotIn('--prepare-vm',args)
+        self.assertNotIn('--setup-driver',args)
+        self.app.SwitchDialog.assert_not_called()
 
 
 
