@@ -452,7 +452,7 @@ apt-get install -y --no-remove --no-install-recommends nvidia-driver-assistant
 
 def recommended_driver_packages(output):
     for line in output.splitlines():
-        match = re.fullmatch(r'\s*(?:sudo\s+)?apt(?:-get)?\s+install\s+(?:-y\s+)?(.+)', line)
+        match = re.fullmatch(r'\s*(?:sudo\s+)?apt(?:-get)?(?:\s+-(?:V|y)+)*\s+install\s+(?:-(?:V|y)+\s+)*(.+)', line)
         if match:
             packages = shlex.split(match[1])
             if packages and all(re.fullmatch(r'[a-z0-9][a-z0-9+.-]*(?::[a-z0-9]+)?(?:=[A-Za-z0-9+.:~_-]+)?', p) for p in packages):

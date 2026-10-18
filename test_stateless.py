@@ -503,6 +503,8 @@ class StatelessTests(unittest.TestCase):
 
     def test_driver_recommendation_rejects_shell_and_options(self):
         self.assertEqual(self.app.recommended_driver_packages('sudo apt install -y nvidia-open'),['nvidia-open'])
+        self.assertEqual(self.app.recommended_driver_packages('  sudo apt-get install -Vy nvidia-open'),['nvidia-open'])
+        self.assertEqual(self.app.recommended_driver_packages('sudo apt -V install -y nvidia-open'),['nvidia-open'])
         for text in ('sudo apt install nvidia-open; reboot','sudo apt install --allow-remove-essential nvidia-open','curl bad | sh'):
             with self.subTest(text=text), self.assertRaises(self.app.Error):
                 self.app.recommended_driver_packages(text)
