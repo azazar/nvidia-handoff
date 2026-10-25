@@ -140,6 +140,18 @@ Fresh boot requires any managed save state to be resumed or removed explicitly i
 
 `connect` enables the Xorg gaming mode; `disconnect` returns Xorg to the primary GPU. These transitions restart the detected display manager and end graphical sessions. Save your work before using `--restart-session`, then sign in again and launch games as your normal user.
 
+### Chrome and Chromium
+
+Xorg mode enables PRIME offload. Launch applications through `run` to select NVIDIA. Exit every Chrome process first, including background apps; a new invocation can otherwise reuse the existing browser process and its GPU.
+
+If a normal Chrome window loses WebGL with `Invalid visual ID requested` or `EGL_NOT_INITIALIZED`, select ANGLE’s Vulkan backend:
+
+```sh
+/opt/nvidia-handoff run -- google-chrome --use-angle=vulkan
+```
+
+Use `chromium` instead of `google-chrome` for Chromium. Check `chrome://gpu` for the active renderer. The Vulkan command was verified with working WebGL on the secondary NVIDIA GPU in a normal X11 window; the same system’s default backend failed. Headless tests alone did not reproduce the normal-window failure.
+
 ## Installed files
 
 | Location | Purpose |
