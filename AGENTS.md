@@ -4,6 +4,8 @@ These rules preserve the user's requested behavior and lessons from previous fix
 
 ## Filesystem scope and minimal footprint
 
+- Use tool-owned overrides in supported `*.d` directories. Never edit packaged configuration files or adopt administrator files for switching. Keep overrides minimal and create them only when the requested operation needs them. Where the application has no supported drop-in mechanism (Docker daemon JSON, libvirt domain XML), use its native configuration/API and change only the required fields; preserve unrelated settings.
+
 - Work in this repository. Its specific exception permits access through `~/src/nvidia-handoff` to `~/Private/Projects/nvidia-handoff`; it does not permit reading or changing any other location under `~/Private/`.
 - Before creating, modifying, moving, or deleting anything outside the user's `$HOME` (`~`) and `/opt`, obtain separate, explicit user approval for the concrete paths and actions. This includes `/tmp`, `/run`, `/etc`, `/usr`, and `/var`. A task request, sudo access, or OS authentication dialog is not blanket approval. Apply this to indirect changes made by commands, installers, scripts, and services, and check symlink destinations.
 - Create files only when the requested action actually needs them. Keep preparation and test artifacts in an allowed location and remove them when no longer needed. Do not create unsolicited backup versions, source duplicates, archives, compatibility links, exports, launchers, or distribution directories.

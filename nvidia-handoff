@@ -154,10 +154,7 @@ def atomic_config(data):
     validate_root_file(CONFIG)
     old, original = receipt(CONFIG)
     if original is None:
-        modes = re.findall(rb'(?im)^\s*Option\s+"AutoAddGPU"\s+"(off|on)"\s*$', old)
-        if len(modes) != 1:
-            raise Error('Expected one AutoAddGPU off/on option')
-        original = modes[0].decode().lower()
+        raise Error('Refusing to adopt an administrator Xorg configuration: ' + str(CONFIG))
     # The caller may have toggled the body of an already marked policy.
     data = RECEIPT.sub(b'', data)
     write_file(CONFIG, marked(data, original), stat.S_IMODE(CONFIG.stat().st_mode))
@@ -269,8 +266,8 @@ def wayland_worker(mode, h, allow_logout):
 def worker(mode, preserve_policy=False, allow_logout=False):
     if os.geteuid() != 0:
         raise Error('The switch worker requires administrator authentication.')
-    ensure_integration()
     h = load_hook()
+    ensure_integration(xorg=not wayland_active() or mode == 'disconnect')
     h.assert_display()
     require_stopped()  # Libvirt query OUTSIDE the GPU lock.
     if wayland_active():
@@ -987,7 +984,8 @@ def select_destination(target, job, shutdown, restart, prepare_vm=False, setup_d
         raise Error('Use the GUI authorization dialog or run select as administrator.')
     h = load_hook()
     h.assert_display()
-    ensure_integration(vm=target not in ('none', 'xorg', 'cuda'))
+    ensure_integration(vm=target not in ('none', 'xorg', 'cuda'),
+                       xorg=not wayland_active() or target not in ('cuda', 'xorg'))
     args = program_command('--selection-worker', target, '--job-id', job)
     if prepare_vm:
         args.append('--prepare-vm')
@@ -1595,11 +1593,11 @@ def refresh_hooks():
             run('/usr/bin/systemctl', 'kill', '--kill-whom=main', '--signal=HUP', daemon)
 
 
-def ensure_integration(vm=False):
+def ensure_integration(vm=False, xorg=True):
     """Called only by an explicit switching/setup action, never by GUI/status."""
     h = load_hook()
     desired = []
-    if not CONFIG.exists():
+    if xorg and not CONFIG.exists():
         desired.append((CONFIG, XORG_OFF, 0o644))
     if vm:
         desired.extend((p, data, 0o644) for p, data in audio_monitor_policy(SETTINGS))

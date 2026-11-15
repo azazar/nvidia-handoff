@@ -95,7 +95,32 @@ class StatelessTests(unittest.TestCase):
         p.chmod(0o644)
         before = p.read_bytes()
         with self.owned_paths():
+            with self.assertRaisesRegex(self.core.Refuse, 'Preserving administrator'):
+                self.core.xorg_path()
+            p.write_bytes(self.app.marked(before, original='off'))
             self.assertEqual(self.core.xorg_path(), str(p))
+            with patch.object(self.core.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)):
+                with self.assertRaisesRegex(self.core.Refuse, 'Packaged Xorg'):
+                    self.core.xorg_path()
+            p.write_bytes(before)
+        self.assertEqual(p.read_bytes(), before)
+
+    def test_wayland_host_setup_creates_no_xorg_policy(self):
+        self.app.CONFIG = self.root / 'missing-xorg-policy'
+        self.app.load_hook = Mock()
+        self.app.write_file = Mock()
+        self.app.ensure_integration(xorg=False)
+        self.app.write_file.assert_not_called()
+        self.assertFalse(self.app.CONFIG.exists())
+
+    def test_main_xorg_file_is_never_adopted_even_when_marked(self):
+        self.core.Path = self.mapped_path
+        p = self.root / 'etc/X11/xorg.conf'
+        p.parent.mkdir(parents=True)
+        p.write_bytes(self.app.marked(self.app.XORG_OFF))
+        before = p.read_bytes()
+        with self.owned_paths(), self.assertRaisesRegex(self.core.Refuse, 'Preserving administrator'):
+            self.core.xorg_path()
         self.assertEqual(p.read_bytes(), before)
 
     def test_conflicting_xorg_policies_refused(self):
@@ -170,6 +195,10 @@ class StatelessTests(unittest.TestCase):
         self.app.CONFIG = p
         self.app.write_file = lambda path, data, mode: path.write_bytes(data)
         with self.owned_paths():
+            with self.assertRaisesRegex(self.app.Error, 'administrator'):
+                self.app.atomic_config(p.read_bytes())
+            self.assertEqual(p.read_bytes(), self.app.XORG_OFF)
+            p.write_bytes(self.app.marked(self.app.XORG_OFF, original='off'))
             self.app.atomic_config(p.read_bytes().replace(b'"off"', b'"on"'))
             body, original = self.app.receipt(p)
             self.assertEqual(original, 'off')

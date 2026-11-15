@@ -800,6 +800,13 @@ def xorg_path():
             raise Refuse('Unsafe Xorg configuration: ' + str(path))
         data = path.read_bytes()
         if re.search(rb'(?im)^\s*Option\s+"AutoAddGPU"', data) or b'nvidia-handoff sha256=' in data:
+            if path.parent != Path('/etc/X11/xorg.conf.d') or b'nvidia-handoff sha256=' not in data:
+                raise Refuse('Preserving administrator Xorg policy: ' + str(path) +
+                             '; resolve AutoAddGPU conflicts before creating a handoff drop-in')
+            owner = subprocess.run(['/usr/bin/dpkg-query', '--search', str(path)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            if owner.returncode != 1:
+                raise Refuse('Packaged Xorg policy or package ownership could not be checked: ' + str(path))
             candidates.append(path)
     if len(candidates) > 1:
         raise Refuse('Multiple AutoAddGPU policies found; resolve them before switching')
