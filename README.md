@@ -58,6 +58,26 @@ sudo /opt/nvidia-handoff --gpu 0000:02:00.0 --display-manager example.service co
 
 To migrate an existing installation, run the same `--install --dry-run` and `--install` commands from the updated source. The installer validates `/etc/nvidia-handoff.json` against live hardware, transfers file ownership and original Xorg policy records into comments in existing integration files, and removes the JSON only after successful installation. It preserves existing recovery transactions and lock locations. Review the preview and authorize the listed system paths before applying it.
 
+## Application-menu launcher
+
+Choose **Create application launcher…** in the GUI menu, or run as your normal user:
+
+```sh
+/opt/nvidia-handoff --create-launcher
+```
+
+This optional action creates `~/.local/share/applications/nvidia-handoff.desktop`, a standard application-menu entry for KDE Plasma and XFCE. It launches the installed GUI as your normal user and uses the desktop’s display icon. Repeating the command leaves an identical launcher untouched. The managed launcher currently requires the standard `~/.local/share` data directory; symlinked paths and customized launchers are refused for review.
+
+Preview or remove just the launcher without changing GPU state:
+
+```sh
+/opt/nvidia-handoff --create-launcher --dry-run
+/opt/nvidia-handoff --remove-launcher --dry-run
+/opt/nvidia-handoff --remove-launcher
+```
+
+Full cleanup from the GUI or through `sudo` previews and removes the invoking user’s unchanged launcher. Direct root sessions without `SUDO_UID` or `PKEXEC_UID` cannot identify its owner; remove the launcher as the desktop user in that case. Other users’ launchers and customized entries are preserved. Launcher creation does not create integration files or probe/switch the GPU.
+
 ## GUI
 
 Open from your normal X11 session:

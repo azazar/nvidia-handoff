@@ -4,6 +4,7 @@
 connect/disconnect require --restart-session: the login manager restarts and logs out users.
 GUI can request graceful VM shutdown after confirmation.
 VM startup: start-vm NAME [--without-gpu].
+Application menu: --create-launcher / --remove-launcher [--dry-run].
 Full uninstall: --cleanup [--dry-run] [--yes].
 Debian with systemd, NVIDIA driver and X.Org or XLibre; Wayland supports host rendering and confirmed logout before passthrough.
 """
@@ -1187,6 +1188,7 @@ class GPUWindow:
         self.messages = queue.Queue()
         self.software_menu = menu = tk.Menu(root)
         menu.add_command(label='VM software…', command=lambda: self.apply(software=True))
+        menu.add_command(label='Create application launcher…', command=self.create_launcher)
         root.configure(menu=menu)
         root.title('NVIDIA handoff — ' + LABEL)
         px, body, self.title_font, columns = configure_gui_style(root)
@@ -1377,13 +1379,22 @@ class GPUWindow:
             args.append('--restart-session')
         self.start_process(args, 'Waiting for administrator authentication…')
 
+    def create_launcher(self):
+        from tkinter import messagebox
+        if self.busy:
+            return
+        try:
+            messagebox.showinfo('Application launcher', application_launcher(), parent=self.root)
+        except Exception as exc:
+            messagebox.showerror('Application launcher', str(exc), parent=self.root)
+
     def cleanup(self):
         from tkinter import messagebox
         if self.busy or not messagebox.askokcancel(
                 'Full cleanup', 'Remove NVIDIA handoff and its integration files?\n\n'
                 'VMs will keep their GPU-free startup settings. Running VMs will not be stopped. '
                 'Cleanup refuses while the GPU is in use. Host sound may need a new login.\n\n'
-                'This also removes the program itself.', parent=self.root):
+                'This also removes the program and your unchanged application-menu launcher.', parent=self.root):
             return
         self.cleaning = True
         self.job = None
@@ -1448,6 +1459,68 @@ class GPUWindow:
         if not self.busy and not self.refreshing and time.monotonic() - self.last_refresh >= 4:
             self.refresh()
         self.root.after(300, self.poll)
+
+
+LAUNCHER = b"""[Desktop Entry]
+Type=Application
+Name=NVIDIA Handoff
+Comment=Share a secondary NVIDIA GPU between desktop applications and virtual machines
+Exec=/opt/nvidia-handoff --gui
+TryExec=/opt/nvidia-handoff
+Icon=video-display
+Terminal=false
+Categories=System;Settings;
+Keywords=NVIDIA;GPU;VFIO;CUDA;
+X-NVIDIA-Handoff-Managed=true
+"""
+
+
+def application_launcher(remove=False, dry_run=False):
+    if os.geteuid() == 0:
+        raise Error('Manage the application launcher as your normal user, without sudo.')
+    home = Path.home()
+    data = home / '.local/share'
+    configured = os.environ.get('XDG_DATA_HOME')
+    if configured and Path(configured) != data:
+        raise Error('The managed launcher requires the standard ~/.local/share application directory.')
+    path = data / 'applications/nvidia-handoff.desktop'
+    for parent in (path, *path.parents):
+        if parent.is_symlink():
+            raise Error('Refusing a symlink in the launcher path: ' + str(parent))
+    if (home / 'Private') in path.parents:
+        raise Error('Refusing a launcher inside the private directory')
+    exists = path.exists()
+    if exists and (not path.is_file() or path.stat().st_uid != os.getuid() or path.read_bytes() != LAUNCHER):
+        raise Error('Preserving a customized or unowned launcher: ' + str(path))
+    if remove:
+        if exists and not dry_run:
+            path.unlink()
+        return ('Would remove: ' if dry_run else 'Removed: ') + str(path) if exists else 'No managed application launcher.'
+    if not exists and not dry_run:
+        if not os.access('/opt/nvidia-handoff', os.X_OK):
+            raise Error('Install NVIDIA handoff in /opt before creating its launcher.')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('xb') as output:
+            os.fchmod(output.fileno(), 0o644)
+            output.write(LAUNCHER)
+    return ('Would create: ' if dry_run else 'Application launcher: ') + str(path)
+
+
+def cleanup_launcher(dry_run):
+    import pwd
+    uid = int(os.environ.get('PKEXEC_UID') or os.environ.get('SUDO_UID') or '0')
+    if uid <= 0:
+        return 'No invoking desktop user; use --remove-launcher as that user to remove their menu entry.'
+    user = pwd.getpwuid(uid)
+    command = ['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--remove-launcher']
+    if dry_run:
+        command.append('--dry-run')
+    result = subprocess.run(command, user=uid, group=user.pw_gid, extra_groups=[],
+                            env={'HOME': user.pw_dir, 'PATH': '/usr/bin:/bin'},
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise Error(result.stderr.strip() or 'Could not remove the user application launcher')
+    return result.stdout.strip()
 
 
 def gui():
@@ -1766,6 +1839,7 @@ def cleanup(args):
             changed = h.disable_optional_xml(xml)
             if changed is not None:
                 guests.append((ident, xml, changed))
+    print(cleanup_launcher(dry_run=True), flush=True)
     print('Remove:\n' + '\n'.join(str(p) for p in files), flush=True)
     print('Remove handoff metadata from VM definitions (keep GPU-free startup): ' + (', '.join(ET.fromstring(x).findtext('name') for _, x, _ in guests) or 'none'), flush=True)
     print('Restore host GPU bindings and original AutoAddGPU setting; remove runtime state. VM power states remain unchanged.', flush=True)
@@ -1805,6 +1879,7 @@ def cleanup(args):
             data = re.sub(rb'(?im)^(\s*Option\s+"AutoAddGPU"\s+")(?:on|off)("\s*)$',
                           lambda m: m[1] + original_mode.encode() + m[2], body)
             write_file(CONFIG, data, stat.S_IMODE(CONFIG.stat().st_mode))
+        print(cleanup_launcher(dry_run=False), flush=True)
         # Removing the program invalidates queued workers before the lock disappears.
         remove_files(files, directories)
         for parent in {Path(name).parent for name in integrations if name.startswith('/etc/wireplumber/')} :
@@ -1956,6 +2031,12 @@ def hook_gpu(h, xml):
 
 
 def main(argv):
+    if argv[:1] in (['--create-launcher'], ['--remove-launcher']):
+        parser = argparse.ArgumentParser(description='Manage the KDE/XFCE application-menu launcher')
+        parser.add_argument('--dry-run', action='store_true')
+        args = parser.parse_args(argv[1:])
+        print(application_launcher(remove=argv[0] == '--remove-launcher', dry_run=args.dry_run))
+        return
     if argv[:1] == ['--install']:
         return install(argv[1:])
     if argv[:1] == ['--probe']:

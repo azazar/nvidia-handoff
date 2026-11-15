@@ -24,6 +24,7 @@ class StatelessTests(unittest.TestCase):
         self.core = module('nvidia_handoff_core.py')
         self.app = module('nvidia-handoff')
         self.app.wayland_active = Mock(return_value=False)
+        self.app.cleanup_launcher = Mock(return_value='No managed application launcher.')
         self.app.tag_guest_driver = Mock()
         self.app.setup_guest_docker = Mock(return_value='Docker skipped.')
         self.addCleanup(os.umask, os.umask(0o077))
@@ -515,6 +516,51 @@ class StatelessTests(unittest.TestCase):
         rows=self.app.destination_rows([record('Alpha',False),record('Zeta',True),record('Beta',False)])
         self.assertEqual([row[0] for row in rows[3:]], ['Zeta','Alpha','Beta'])
         self.assertTrue(all(row[4] for row in rows))
+
+    def test_application_launcher_create_preview_and_remove(self):
+        with patch.object(Path, 'home', return_value=self.root), patch.dict(os.environ, {}, clear=True), patch.object(os, 'geteuid', return_value=1000), patch.object(os, 'access', return_value=True):
+            target = self.root / '.local/share/applications/nvidia-handoff.desktop'
+            self.app.initialize = Mock(side_effect=AssertionError('Launcher creation probed GPU'))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.app.main(['--create-launcher', '--dry-run'])
+            self.assertFalse(target.parent.exists())
+            self.app.application_launcher()
+            self.assertEqual(target.read_bytes(), self.app.LAUNCHER)
+            if Path('/usr/bin/desktop-file-validate').exists():
+                self.app.subprocess.run(['/usr/bin/desktop-file-validate', str(target)], check=True, capture_output=True)
+            before = target.stat().st_mtime_ns
+            self.app.application_launcher()
+            self.assertEqual(target.stat().st_mtime_ns, before)
+            self.app.application_launcher(remove=True, dry_run=True)
+            self.assertTrue(target.exists())
+            self.app.application_launcher(remove=True)
+            self.assertFalse(target.exists())
+            self.assertTrue(target.parent.exists())
+
+    def test_application_launcher_preserves_edits_and_refuses_symlinks(self):
+        with patch.object(Path, 'home', return_value=self.root), patch.dict(os.environ, {}, clear=True), patch.object(os, 'geteuid', return_value=1000):
+            target = self.root / '.local/share/applications/nvidia-handoff.desktop'
+            target.parent.mkdir(parents=True)
+            target.write_text('custom launcher')
+            for remove in (True, False):
+                with self.assertRaisesRegex(self.app.Error, 'Preserving'):
+                    self.app.application_launcher(remove=remove)
+            target.unlink()
+            target.symlink_to(self.root / 'unrelated')
+            with self.assertRaisesRegex(self.app.Error, 'symlink'):
+                self.app.application_launcher(remove=True)
+
+    def test_cleanup_launcher_drops_privileges_and_uses_invoking_home(self):
+        import pwd
+        app = module('nvidia-handoff')
+        account = types.SimpleNamespace(pw_gid=1000, pw_dir='/home/example')
+        with patch.dict(os.environ, {'PKEXEC_UID': '1000'}, clear=True), patch.object(pwd, 'getpwuid', return_value=account), patch.object(app.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout='Removed', stderr='')) as run:
+            self.assertEqual(app.cleanup_launcher(False), 'Removed')
+            self.assertEqual(run.call_args.kwargs['user'], 1000)
+            self.assertEqual(run.call_args.kwargs['env']['HOME'], '/home/example')
+            self.assertIn('--remove-launcher', run.call_args.args[0])
+            app.cleanup_launcher(True)
+            self.assertIn('--dry-run', run.call_args.args[0])
 
     def test_wayland_detection_and_xwayland_gui(self):
         self.core.session_records = Mock(return_value=[{'Type': 'wayland', 'State': 'active'}])
