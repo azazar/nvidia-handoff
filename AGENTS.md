@@ -50,7 +50,7 @@ These rules preserve the user's requested behavior and lessons from previous fix
 
 ## Cleanup and verification
 
-- Preserve both the GUI Full cleanup action and CLI `--cleanup` / `--cleanup --dry-run`. Preview must not create or change files. Refuse a busy GPU or active transition before changing anything.
+- Preserve both the GUI Full cleanup action and CLI `cleanup` / `cleanup --dry-run`. Preview must not create or change files. Refuse a busy GPU or active transition before changing anything.
 - Remove only verified tool-owned files, expected artifacts, and metadata. Validate paths, permissions, symlinks, and recorded content hashes. Preserve administrator edits and unexpected files; never recursively delete an unverified directory or restore a stale full VM definition.
 - Full removal leaves VM startup GPU-free, restores owned host policy safely, and removes runtime and abandoned progress files. Do not remove the source repository or system journal history. Prevent stale workers from recreating state after uninstall.
 - Test each code change using focused checks. Cover busy refusal, rollback, both boot modes, live attachment failures, UUID/name dispatch, current-target button state, asynchronous success/failure, and long-error layout as relevant.

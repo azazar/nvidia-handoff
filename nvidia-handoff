@@ -4,8 +4,8 @@
 connect/disconnect require --restart-session: the login manager restarts and logs out users.
 GUI can request graceful VM shutdown after confirmation.
 VM startup: start-vm NAME [--without-gpu].
-Application menu: --create-launcher / --remove-launcher [--dry-run].
-Full uninstall: --cleanup [--dry-run] [--yes].
+Application menu: create-launcher / remove-launcher [--dry-run].
+Full uninstall: cleanup [--dry-run] [--yes].
 Debian with systemd, NVIDIA driver and X.Org or XLibre; Wayland supports host rendering and confirmed logout before passthrough.
 """
 import argparse
@@ -1398,7 +1398,7 @@ class GPUWindow:
             return
         self.cleaning = True
         self.job = None
-        self.start_process(['/usr/bin/pkexec', '--disable-internal-agent', *program_command('--cleanup', '--yes')],
+        self.start_process(['/usr/bin/pkexec', '--disable-internal-agent', *program_command('cleanup', '--yes')],
                            'Waiting for administrator authentication…')
 
     def poll(self):
@@ -1543,9 +1543,9 @@ def cleanup_launcher(dry_run):
     import pwd
     uid = int(os.environ.get('PKEXEC_UID') or os.environ.get('SUDO_UID') or '0')
     if uid <= 0:
-        return 'No invoking desktop user; use --remove-launcher as that user to remove their menu entry.'
+        return 'No invoking desktop user; use remove-launcher as that user to remove their menu entry.'
     user = pwd.getpwuid(uid)
-    command = ['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--remove-launcher']
+    command = ['/usr/bin/python3', '-I', str(Path(__file__).resolve()), 'remove-launcher']
     if dry_run:
         command.append('--dry-run')
     result = subprocess.run(command, user=uid, group=user.pw_gid, extra_groups=[],
@@ -2064,11 +2064,11 @@ def hook_gpu(h, xml):
 
 
 def main(argv):
-    if argv[:1] in (['--create-launcher'], ['--remove-launcher']):
+    if argv[:1] in (['create-launcher'], ['remove-launcher']):
         parser = argparse.ArgumentParser(description='Manage the KDE/XFCE application-menu launcher')
         parser.add_argument('--dry-run', action='store_true')
         args = parser.parse_args(argv[1:])
-        print(application_launcher(remove=argv[0] == '--remove-launcher', dry_run=args.dry_run))
+        print(application_launcher(remove=argv[0] == 'remove-launcher', dry_run=args.dry_run))
         return
     if argv[:1] == ['--install']:
         return install(argv[1:])
@@ -2100,13 +2100,13 @@ def main(argv):
         initialize(gpu)
         return load_hook().main(args, xml)
     initialize(gpu, manager)
-    if argv[:1] in (['--cleanup'], ['cleanup']):
+    if argv[:1] == ['cleanup']:
         parser = argparse.ArgumentParser(description='Remove NVIDIA handoff and restore its integration changes')
         parser.add_argument('--dry-run', action='store_true', help='Show files, VM restoration and blockers without changing anything')
         parser.add_argument('--yes', action='store_true', help='Confirm full removal')
         args = parser.parse_args(argv[1:])
         if os.geteuid() != 0:
-            result = subprocess.run(['/usr/bin/pkexec', '--disable-internal-agent', *program_command('--cleanup', *argv[1:])])
+            result = subprocess.run(['/usr/bin/pkexec', '--disable-internal-agent', *program_command('cleanup', *argv[1:])])
             if result.returncode:
                 raise Error('Cleanup did not complete (exit ' + str(result.returncode) + ').')
             return

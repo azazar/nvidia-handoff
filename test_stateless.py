@@ -525,7 +525,7 @@ class StatelessTests(unittest.TestCase):
             target = self.root / '.local/share/applications/nvidia-handoff.desktop'
             self.app.initialize = Mock(side_effect=AssertionError('Launcher creation probed GPU'))
             with contextlib.redirect_stdout(io.StringIO()):
-                self.app.main(['--create-launcher', '--dry-run'])
+                self.app.main(['create-launcher', '--dry-run'])
             self.assertFalse(target.parent.exists())
             self.app.application_launcher()
             icon = self.root / '.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg'
@@ -539,7 +539,8 @@ class StatelessTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mtime_ns, before)
             self.app.application_launcher(remove=True, dry_run=True)
             self.assertTrue(target.exists())
-            self.app.application_launcher(remove=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.app.main(['remove-launcher'])
             self.assertFalse(target.exists())
             self.assertFalse(icon.exists())
             self.assertTrue(target.parent.exists())
@@ -601,11 +602,11 @@ class StatelessTests(unittest.TestCase):
             self.assertFalse(icon.exists())
             self.assertEqual(self.app.application_launcher(remove=True), 'No managed launcher or icon.')
 
-    def test_cleanup_alias_and_authorization(self):
+    def test_cleanup_command_and_authorization(self):
         self.app.initialize = Mock()
         self.app.cleanup = Mock()
-        self.app.program_command = Mock(return_value=['/opt/nvidia-handoff', '--cleanup'])
-        for command in ('cleanup', '--cleanup'):
+        self.app.program_command = Mock(return_value=['/opt/nvidia-handoff', 'cleanup'])
+        for command in ('cleanup',):
             with patch.object(os, 'geteuid', return_value=0):
                 self.app.main([command, '--dry-run'])
                 self.assertTrue(self.app.cleanup.call_args.args[0].dry_run)
@@ -613,7 +614,7 @@ class StatelessTests(unittest.TestCase):
                 self.app.cleanup.reset_mock()
                 self.app.main([command, '--dry-run'])
                 self.app.cleanup.assert_not_called()
-                self.app.program_command.assert_called_with('--cleanup', '--dry-run')
+                self.app.program_command.assert_called_with('cleanup', '--dry-run')
                 self.assertEqual(run.call_args.args[0][:2], ['/usr/bin/pkexec', '--disable-internal-agent'])
                 run.return_value.returncode = 126
                 with self.assertRaisesRegex(self.app.Error, 'did not complete'):
@@ -627,7 +628,7 @@ class StatelessTests(unittest.TestCase):
             self.assertEqual(app.cleanup_launcher(False), 'Removed')
             self.assertEqual(run.call_args.kwargs['user'], 1000)
             self.assertEqual(run.call_args.kwargs['env']['HOME'], '/home/example')
-            self.assertIn('--remove-launcher', run.call_args.args[0])
+            self.assertIn('remove-launcher', run.call_args.args[0])
             app.cleanup_launcher(True)
             self.assertIn('--dry-run', run.call_args.args[0])
 

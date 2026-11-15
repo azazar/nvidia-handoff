@@ -58,14 +58,14 @@ sudo /opt/nvidia-handoff --gpu 0000:02:00.0 --display-manager example.service co
 
 To migrate an existing installation, run the same `--install --dry-run` and `--install` commands from the updated source. The installer validates `/etc/nvidia-handoff.json` against live hardware, transfers file ownership and original Xorg policy records into comments in existing integration files, and removes the JSON only after successful installation. It preserves existing recovery transactions and lock locations. Review the preview and authorize the listed system paths before applying it.
 
-`cleanup` and `--cleanup` are equivalent; a normal-user invocation requests administrator authorization, including for the full preview.
+`cleanup` requests administrator authorization when invoked as a normal user, including for the full preview.
 
 ## Application-menu launcher
 
 Choose **Create application launcher…** in the GUI menu, or run as your normal user:
 
 ```sh
-/opt/nvidia-handoff --create-launcher
+/opt/nvidia-handoff create-launcher
 ```
 
 This optional action creates `~/.local/share/applications/nvidia-handoff.desktop`, a standard application-menu entry for KDE Plasma and XFCE. It launches the installed GUI as your normal user and uses its own scalable SVG GPU icon, referenced by absolute path so it does not depend on icon-theme lookup. Rerun the creation command to upgrade an existing managed launcher. Repeating the command leaves an identical launcher untouched. The managed launcher currently requires the standard `~/.local/share` data directory; directory symlinks resolving within your home are supported. Launcher/icon file symlinks and customized files are refused for review. The icon is created only with the launcher, at `~/.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg`.
@@ -73,9 +73,9 @@ This optional action creates `~/.local/share/applications/nvidia-handoff.desktop
 Preview or remove just the launcher without changing GPU state:
 
 ```sh
-/opt/nvidia-handoff --create-launcher --dry-run
-/opt/nvidia-handoff --remove-launcher --dry-run
-/opt/nvidia-handoff --remove-launcher
+/opt/nvidia-handoff create-launcher --dry-run
+/opt/nvidia-handoff remove-launcher --dry-run
+/opt/nvidia-handoff remove-launcher
 ```
 
 Full cleanup from the GUI or through `sudo` previews and removes the invoking user’s unchanged launcher and icon. Direct root sessions without `SUDO_UID` or `PKEXEC_UID` cannot identify its owner; remove the launcher as the desktop user in that case. Other users’ launchers and customized entries are preserved. A modified launcher or icon is reported and left intact without blocking full cleanup; an unchanged orphaned icon is removed. Launcher creation does not create integration files or probe/switch the GPU.
