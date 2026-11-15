@@ -526,6 +526,9 @@ class StatelessTests(unittest.TestCase):
             self.assertFalse(target.parent.exists())
             self.app.application_launcher()
             self.assertEqual(target.read_bytes(), self.app.LAUNCHER)
+            icon = self.root / '.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg'
+            self.assertEqual(icon.read_bytes(), self.app.LAUNCHER_ICON)
+            self.app.ET.fromstring(icon.read_bytes())
             if Path('/usr/bin/desktop-file-validate').exists():
                 self.app.subprocess.run(['/usr/bin/desktop-file-validate', str(target)], check=True, capture_output=True)
             before = target.stat().st_mtime_ns
@@ -535,6 +538,7 @@ class StatelessTests(unittest.TestCase):
             self.assertTrue(target.exists())
             self.app.application_launcher(remove=True)
             self.assertFalse(target.exists())
+            self.assertFalse(icon.exists())
             self.assertTrue(target.parent.exists())
 
     def test_application_launcher_preserves_edits_and_refuses_symlinks(self):
@@ -549,6 +553,34 @@ class StatelessTests(unittest.TestCase):
             target.symlink_to(self.root / 'unrelated')
             with self.assertRaisesRegex(self.app.Error, 'symlink'):
                 self.app.application_launcher(remove=True)
+
+    def test_launcher_directory_symlinks_and_legacy_upgrade(self):
+        home = self.root / 'home'
+        home.mkdir()
+        (home / 'Private').mkdir()
+        (home / '.local').symlink_to(home / 'Private', target_is_directory=True)
+        with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {}, clear=True), patch.object(os, 'geteuid', return_value=1000), patch.object(os, 'access', return_value=True):
+            self.app.application_launcher()
+            target = home / '.local/share/applications/nvidia-handoff.desktop'
+            target.write_bytes(self.app.LAUNCHER.replace(b'Icon=nvidia-handoff', b'Icon=video-display'))
+            self.app.application_launcher()
+            self.assertEqual(target.read_bytes(), self.app.LAUNCHER)
+            icon = home / '.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg'
+            icon.write_text('custom icon')
+            with self.assertRaisesRegex(self.app.Error, 'Preserving'):
+                self.app.application_launcher(remove=True)
+            self.assertTrue(target.exists())
+            icon.unlink()
+            icon.symlink_to(self.root / 'unrelated')
+            with self.assertRaisesRegex(self.app.Error, 'symlink'):
+                self.app.application_launcher()
+            icon.unlink()
+            self.app.application_launcher(remove=True)
+            self.assertFalse(target.exists())
+            (home / '.local').unlink()
+            (home / '.local').symlink_to(self.root, target_is_directory=True)
+            with self.assertRaisesRegex(self.app.Error, 'outside your home'):
+                self.app.application_launcher()
 
     def test_cleanup_launcher_drops_privileges_and_uses_invoking_home(self):
         import pwd

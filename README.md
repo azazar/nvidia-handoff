@@ -66,7 +66,7 @@ Choose **Create application launcher…** in the GUI menu, or run as your normal
 /opt/nvidia-handoff --create-launcher
 ```
 
-This optional action creates `~/.local/share/applications/nvidia-handoff.desktop`, a standard application-menu entry for KDE Plasma and XFCE. It launches the installed GUI as your normal user and uses the desktop’s display icon. Repeating the command leaves an identical launcher untouched. The managed launcher currently requires the standard `~/.local/share` data directory; symlinked paths and customized launchers are refused for review.
+This optional action creates `~/.local/share/applications/nvidia-handoff.desktop`, a standard application-menu entry for KDE Plasma and XFCE. It launches the installed GUI as your normal user and uses its own scalable SVG GPU icon. Repeating the command leaves an identical launcher untouched. The managed launcher currently requires the standard `~/.local/share` data directory; directory symlinks resolving within your home are supported. Launcher/icon file symlinks and customized files are refused for review. The icon is created only with the launcher, at `~/.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg`.
 
 Preview or remove just the launcher without changing GPU state:
 
@@ -76,7 +76,7 @@ Preview or remove just the launcher without changing GPU state:
 /opt/nvidia-handoff --remove-launcher
 ```
 
-Full cleanup from the GUI or through `sudo` previews and removes the invoking user’s unchanged launcher. Direct root sessions without `SUDO_UID` or `PKEXEC_UID` cannot identify its owner; remove the launcher as the desktop user in that case. Other users’ launchers and customized entries are preserved. Launcher creation does not create integration files or probe/switch the GPU.
+Full cleanup from the GUI or through `sudo` previews and removes the invoking user’s unchanged launcher and icon. Direct root sessions without `SUDO_UID` or `PKEXEC_UID` cannot identify its owner; remove the launcher as the desktop user in that case. Other users’ launchers and customized entries are preserved. Launcher creation does not create integration files or probe/switch the GPU.
 
 ## GUI
 
