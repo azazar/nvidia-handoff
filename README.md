@@ -58,6 +58,8 @@ sudo /opt/nvidia-handoff --gpu 0000:02:00.0 --display-manager example.service co
 
 To migrate an existing installation, run the same `--install --dry-run` and `--install` commands from the updated source. The installer validates `/etc/nvidia-handoff.json` against live hardware, transfers file ownership and original Xorg policy records into comments in existing integration files, and removes the JSON only after successful installation. It preserves existing recovery transactions and lock locations. Review the preview and authorize the listed system paths before applying it.
 
+`cleanup` and `--cleanup` are equivalent; a normal-user invocation requests administrator authorization, including for the full preview.
+
 ## Application-menu launcher
 
 Choose **Create application launcher…** in the GUI menu, or run as your normal user:
@@ -76,7 +78,7 @@ Preview or remove just the launcher without changing GPU state:
 /opt/nvidia-handoff --remove-launcher
 ```
 
-Full cleanup from the GUI or through `sudo` previews and removes the invoking user’s unchanged launcher and icon. Direct root sessions without `SUDO_UID` or `PKEXEC_UID` cannot identify its owner; remove the launcher as the desktop user in that case. Other users’ launchers and customized entries are preserved. Launcher creation does not create integration files or probe/switch the GPU.
+Full cleanup from the GUI or through `sudo` previews and removes the invoking user’s unchanged launcher and icon. Direct root sessions without `SUDO_UID` or `PKEXEC_UID` cannot identify its owner; remove the launcher as the desktop user in that case. Other users’ launchers and customized entries are preserved. A modified launcher or icon is reported and left intact without blocking full cleanup; an unchanged orphaned icon is removed. Launcher creation does not create integration files or probe/switch the GPU.
 
 ## GUI
 
@@ -199,8 +201,8 @@ The WirePlumber policy excludes the selected displayless GPU's HDMI audio from h
 ## Cleanup
 
 ```sh
-sudo /opt/nvidia-handoff --cleanup --dry-run
-sudo /opt/nvidia-handoff --cleanup
+/opt/nvidia-handoff cleanup --dry-run
+/opt/nvidia-handoff cleanup
 ```
 
 The GUI provides the same operation through **Full cleanup…**. Interactive CLI removal asks for `REMOVE`; `--yes` confirms noninteractive removal.

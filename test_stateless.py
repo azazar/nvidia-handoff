@@ -401,6 +401,7 @@ class StatelessTests(unittest.TestCase):
 
     def test_full_cleanup_restores_user_policy_without_configuration_manifest(self):
         h, runtime, hook, xorg = self.cleanup_fixture()
+        self.app.cleanup_launcher.return_value = 'Preserved launcher and icon: customized file'
         args = types.SimpleNamespace(dry_run=False, yes=True)
         with self.owned_paths(), patch.object(os, 'geteuid', return_value=0), \
              patch.object(self.app.shutil, 'which', return_value=None), contextlib.redirect_stdout(io.StringIO()):
@@ -410,6 +411,8 @@ class StatelessTests(unittest.TestCase):
         self.assertFalse(runtime.exists())
         self.assertFalse((self.root / 'opt/nvidia-handoff').exists())
         self.app.restore_host.assert_called_once_with(h)
+        self.assertEqual([call.kwargs for call in self.app.cleanup_launcher.call_args_list],
+                         [{'dry_run': True}, {'dry_run': False}])
 
     def test_cleanup_preview_creates_no_lock_or_files(self):
         h, runtime, hook, xorg = self.cleanup_fixture()
@@ -546,13 +549,15 @@ class StatelessTests(unittest.TestCase):
             target = self.root / '.local/share/applications/nvidia-handoff.desktop'
             target.parent.mkdir(parents=True)
             target.write_text('custom launcher')
-            for remove in (True, False):
-                with self.assertRaisesRegex(self.app.Error, 'Preserving'):
-                    self.app.application_launcher(remove=remove)
+            with self.assertRaisesRegex(self.app.Error, 'Preserving'):
+                self.app.application_launcher()
+            for dry_run in (True, False):
+                self.assertIn('Preserved', self.app.application_launcher(remove=True, dry_run=dry_run))
+                self.assertEqual(target.read_text(), 'custom launcher')
             target.unlink()
             target.symlink_to(self.root / 'unrelated')
-            with self.assertRaisesRegex(self.app.Error, 'symlink'):
-                self.app.application_launcher(remove=True)
+            self.assertIn('Preserved', self.app.application_launcher(remove=True))
+            self.assertTrue(target.is_symlink())
 
     def test_launcher_directory_symlinks_and_legacy_upgrade(self):
         home = self.root / 'home'
@@ -569,9 +574,9 @@ class StatelessTests(unittest.TestCase):
                 self.app.application_launcher()
                 self.assertEqual(target.read_bytes(), expected)
             icon.write_text('custom icon')
-            with self.assertRaisesRegex(self.app.Error, 'Preserving'):
-                self.app.application_launcher(remove=True)
+            self.assertIn('Preserved', self.app.application_launcher(remove=True))
             self.assertTrue(target.exists())
+            self.assertEqual(icon.read_text(), 'custom icon')
             icon.unlink()
             icon.symlink_to(self.root / 'unrelated')
             with self.assertRaisesRegex(self.app.Error, 'symlink'):
@@ -583,6 +588,36 @@ class StatelessTests(unittest.TestCase):
             (home / '.local').symlink_to(self.root, target_is_directory=True)
             with self.assertRaisesRegex(self.app.Error, 'outside your home'):
                 self.app.application_launcher()
+
+    def test_cleanup_removes_orphaned_icon(self):
+        with patch.object(Path, 'home', return_value=self.root), patch.dict(os.environ, {}, clear=True), patch.object(os, 'geteuid', return_value=1000), patch.object(os, 'access', return_value=True):
+            self.app.application_launcher()
+            target = self.root / '.local/share/applications/nvidia-handoff.desktop'
+            icon = self.root / '.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg'
+            target.unlink()
+            self.assertIn(str(icon), self.app.application_launcher(remove=True, dry_run=True))
+            self.assertTrue(icon.exists())
+            self.app.application_launcher(remove=True)
+            self.assertFalse(icon.exists())
+            self.assertEqual(self.app.application_launcher(remove=True), 'No managed launcher or icon.')
+
+    def test_cleanup_alias_and_authorization(self):
+        self.app.initialize = Mock()
+        self.app.cleanup = Mock()
+        self.app.program_command = Mock(return_value=['/opt/nvidia-handoff', '--cleanup'])
+        for command in ('cleanup', '--cleanup'):
+            with patch.object(os, 'geteuid', return_value=0):
+                self.app.main([command, '--dry-run'])
+                self.assertTrue(self.app.cleanup.call_args.args[0].dry_run)
+            with patch.object(os, 'geteuid', return_value=1000), patch.object(self.app.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                self.app.cleanup.reset_mock()
+                self.app.main([command, '--dry-run'])
+                self.app.cleanup.assert_not_called()
+                self.app.program_command.assert_called_with('--cleanup', '--dry-run')
+                self.assertEqual(run.call_args.args[0][:2], ['/usr/bin/pkexec', '--disable-internal-agent'])
+                run.return_value.returncode = 126
+                with self.assertRaisesRegex(self.app.Error, 'did not complete'):
+                    self.app.main([command])
 
     def test_cleanup_launcher_drops_privileges_and_uses_invoking_home(self):
         import pwd

@@ -1504,14 +1504,20 @@ def application_launcher(remove=False, dry_run=False):
         path = data / relative
         parent = path.parent.resolve()
         if not parent.is_relative_to(home):
+            if remove:
+                return 'Preserved launcher and icon: path resolves outside your home: ' + str(path)
             raise Error('Launcher path resolves outside your home: ' + str(path))
         path = parent / path.name
         if path.is_symlink():
+            if remove:
+                return 'Preserved launcher and icon: symlink at ' + str(path)
             raise Error('Refusing a symlink in the launcher path: ' + str(path))
         exists = path.exists()
         legacy = LAUNCHER.replace(b'Icon=nvidia-handoff', b'Icon=video-display')
         accepted = (content, LAUNCHER, legacy) if content == launcher else (content,)
         if exists and (not path.is_file() or path.stat().st_uid != os.getuid() or path.read_bytes() not in accepted):
+            if remove:
+                return 'Preserved launcher and icon: customized or unowned file: ' + str(path)
             raise Error('Preserving a customized or unowned launcher file: ' + str(path))
         files.append((path, content, exists))
     if not remove and not dry_run and not os.access('/opt/nvidia-handoff', os.X_OK):
@@ -1528,7 +1534,9 @@ def application_launcher(remove=False, dry_run=False):
                 os.fchmod(output.fileno(), 0o644)
                 output.write(content)
     action = 'remove' if remove else 'create'
-    return ('Would ' + action if dry_run else 'Removed' if remove else 'Application launcher') + ': ' + str(files[0][0])
+    if remove and not any(exists for _, _, exists in files):
+        return 'No managed launcher or icon.'
+    return ('Would ' + action if dry_run else 'Removed' if remove else 'Application launcher') + ': ' + ', '.join(str(path) for path, _, exists in files if exists or not remove)
 
 
 def cleanup_launcher(dry_run):
@@ -1868,7 +1876,7 @@ def cleanup(args):
     print('Remove:\n' + '\n'.join(str(p) for p in files), flush=True)
     print('Remove handoff metadata from VM definitions (keep GPU-free startup): ' + (', '.join(ET.fromstring(x).findtext('name') for _, x, _ in guests) or 'none'), flush=True)
     print('Restore host GPU bindings and original AutoAddGPU setting; remove runtime state. VM power states remain unchanged.', flush=True)
-    print('Private home directories are not inspected. System journal history is retained.', flush=True)
+    print('Only the invoking user’s launcher/icon paths are inspected in their home. System journal history is retained.', flush=True)
     if args.dry_run:
         try:
             cleanup_blockers(h)
@@ -2092,11 +2100,17 @@ def main(argv):
         initialize(gpu)
         return load_hook().main(args, xml)
     initialize(gpu, manager)
-    if argv[:1] == ['--cleanup']:
+    if argv[:1] in (['--cleanup'], ['cleanup']):
         parser = argparse.ArgumentParser(description='Remove NVIDIA handoff and restore its integration changes')
         parser.add_argument('--dry-run', action='store_true', help='Show files, VM restoration and blockers without changing anything')
         parser.add_argument('--yes', action='store_true', help='Confirm full removal')
-        return cleanup(parser.parse_args(argv[1:]))
+        args = parser.parse_args(argv[1:])
+        if os.geteuid() != 0:
+            result = subprocess.run(['/usr/bin/pkexec', '--disable-internal-agent', *program_command('--cleanup', *argv[1:])])
+            if result.returncode:
+                raise Error('Cleanup did not complete (exit ' + str(result.returncode) + ').')
+            return
+        return cleanup(args)
     if argv[:1] == ['enable-optional']:
         return enable_optional_guests()
     if argv[:1] == ['start-vm']:
