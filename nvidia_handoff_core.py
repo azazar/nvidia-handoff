@@ -339,7 +339,7 @@ def restore(s, rollback=False):
     assert_claim(s, allow_domain=True)
     target = s['before'] if rollback else s['host']
     topology()
-    assert_x11()
+    assert_display()
     changed = any(driver(b) != target['drivers'][b] for b in DEVICES)
     if changed:
         guard()
@@ -379,7 +379,7 @@ def xorg_mode():
 
 
 def prepare(parking=False):
-    assert_x11()
+    assert_display()
     if (STATE_DIR / 'uninstalling').exists():
         raise Refuse('Full cleanup is in progress')
     isolation = isolated()
@@ -951,14 +951,15 @@ def session_records():
     return result
 
 
-def assert_x11(need_display=False):
-    if os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland' or os.environ.get('WAYLAND_DISPLAY'):
-        raise Refuse('Wayland/Xwayland is unsupported. Use an Xorg session and Xorg greeter.')
-    for session in session_records():
-        if session.get('Type') == 'wayland' and session.get('State') != 'closing':
-            raise Refuse('A Wayland user/greeter session is present. Configure the login manager for Xorg first.')
+def wayland_active():
+    return bool(os.environ.get('WAYLAND_DISPLAY') or
+                os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland' or
+                any(s.get('Type') == 'wayland' and s.get('State') != 'closing' for s in session_records()))
+
+
+def assert_display(need_display=False):
     if need_display and not os.environ.get('DISPLAY'):
-        raise Refuse('Open the GUI from an X11 desktop session')
+        raise Refuse('The Tk GUI requires DISPLAY (X11 or Xwayland). CLI operations support native Wayland.')
 
 
 def display_manager():

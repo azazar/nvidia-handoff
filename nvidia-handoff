@@ -5,7 +5,7 @@ connect/disconnect require --restart-session: the login manager restarts and log
 GUI can request graceful VM shutdown after confirmation.
 VM startup: start-vm NAME [--without-gpu].
 Full uninstall: --cleanup [--dry-run] [--yes].
-Debian with systemd, NVIDIA driver and X.Org or XLibre; Wayland is refused.
+Debian with systemd, NVIDIA driver and X.Org or XLibre; Wayland supports host rendering and confirmed logout before passthrough.
 """
 import argparse
 from contextlib import contextmanager
@@ -121,8 +121,8 @@ def nvidia_provider(text):
 def status():
     h = load_hook()
     print(LABEL, GPU)
-    print('X11 session check:', end=' ')
-    h.assert_x11()
+    print('Display session:', 'Wayland' if wayland_active() else 'X11/headless', end=' ')
+    h.assert_display()
     print('passed')
     print('IOMMU isolation:', h.isolated())
     for b in BDFS:
@@ -197,7 +197,7 @@ def xorg_owners(h):
 def wait_xorg(h, old, gaming):
     deadline = time.monotonic() + 25
     while time.monotonic() < deadline:
-        h.assert_x11()
+        h.assert_display()
         current = xorg_processes(h)
         if current and current.isdisjoint(old) and bool(xorg_owners(h)) == gaming:
             return
@@ -219,13 +219,66 @@ def restore_host(h):
         raise Error('Host driver binding verification failed')
 
 
-def worker(mode, preserve_policy=False):
+def wayland_active():
+    return load_hook().wayland_active()
+
+
+def wayland_worker(mode, h, allow_logout):
+    if mode == 'connect':
+        with locked(h):
+            restore_host(h)
+            h.run('/usr/sbin/modprobe', 'nvidia_drm')
+            h.run('/usr/sbin/modprobe', 'nvidia_uvm')
+            h.topology()
+        return
+    if all(h.driver(b) in (None, 'vfio-pci') for b in BDFS) and h.xorg_mode() == 'off':
+        return
+    if not allow_logout:
+        raise Error('Wayland handoff requires confirmed logout; add --restart-session.')
+    manager = h.display_manager()
+    marker = h.STATE_DIR / 'xorg-transition'
+    with locked(h):
+        h.topology()
+        h.idle(h.vfio_nodes())
+        marker.write_text('wayland-disconnect\n')
+        marker.chmod(0o600)
+    # Stop/start outside the GPU lock: login-manager dependencies can call libvirt.
+    try:
+        h.run('/usr/bin/systemctl', 'stop', manager)
+        with locked(h):
+            original = CONFIG.read_bytes()
+            text, count = re.subn(r'(?im)^(\s*Option\s+"AutoAddGPU"\s+")(?:off|on)("\s*)$',
+                                  lambda m: m[1] + 'off' + m[2], original.decode())
+            if count != 1:
+                raise Error('Expected one AutoAddGPU off/on option')
+            try:
+                if text.encode() != original:
+                    atomic_config(text.encode())
+                marker.unlink()  # Still locked; park performs all busy/rollback checks.
+                h.park()
+            except BaseException:
+                marker.write_text('wayland-disconnect\n')
+                marker.chmod(0o600)
+                if CONFIG.read_bytes() != original:
+                    atomic_config(original)
+                raise
+    finally:
+        h.run('/usr/bin/systemctl', 'start', manager)
+
+
+def worker(mode, preserve_policy=False, allow_logout=False):
     if os.geteuid() != 0:
         raise Error('The switch worker requires administrator authentication.')
     ensure_integration()
     h = load_hook()
-    h.assert_x11()
+    h.assert_display()
     require_stopped()  # Libvirt query OUTSIDE the GPU lock.
+    if wayland_active():
+        wayland_worker(mode, h, allow_logout)
+        if not preserve_policy:
+            with locked(h):
+                h.choose_target('cuda' if mode == 'connect' else None)
+        return
     fd = h.lock()
     marker = h.STATE_DIR / 'xorg-transition'
     original = None
@@ -303,21 +356,26 @@ def switch(mode, restart):
 def launch(command):
     if os.geteuid() == 0:
         raise Error('Launch games as your normal user.')
-    load_hook().assert_x11(need_display=True)
+    if not wayland_active():
+        load_hook().assert_display(need_display=True)
     require_stopped()
     if pci_driver(GPU) != 'nvidia':
         raise Error('GPU is not attached to the host; connect it first.')
     if load_hook().shared_nvidia_driver():
         raise Error('Multiple host NVIDIA GPUs: automatic PRIME provider selection is ambiguous.')
-    provider = nvidia_provider(providers())
-    if not provider:
+    provider = None if wayland_active() else nvidia_provider(providers())
+    if not provider and not wayland_active():
         raise Error('No NVIDIA X11 provider. Use connect --restart-session after saving work.')
     if command[:1] == ['--']:
         command = command[1:]
     if not command:
         raise Error('Specify the game/application after /opt/nvidia-handoff run.')
     os.environ.update(__NV_PRIME_RENDER_OFFLOAD='1', __GLX_VENDOR_LIBRARY_NAME='nvidia',
-                      __NV_PRIME_RENDER_OFFLOAD_PROVIDER=provider, __VK_LAYER_NV_optimus='NVIDIA_only')
+                      __VK_LAYER_NV_optimus='NVIDIA_only')
+    if provider:
+        os.environ['__NV_PRIME_RENDER_OFFLOAD_PROVIDER'] = provider
+    else:
+        os.environ.pop('__NV_PRIME_RENDER_OFFLOAD_PROVIDER', None)
     os.execvp(command[0], command)
 
 
@@ -658,7 +716,7 @@ def attach_running(ident):
     if set(selected['live_gpu']) == set(BDFS):
         return
     with locked(h):
-        h.assert_x11()
+        h.assert_display()
         if any(d['live_gpu'] for d in records if d['uuid'] != ident):
             raise Error('GPU belongs to another guest; no live attachment performed')
         if h.xorg_mode() != 'off' or (h.STATE_DIR / 'xorg-transition').exists():
@@ -779,6 +837,8 @@ def destination_rows(records):
     rows = [('none', 'None', 'Idle GPU', 'Leave GPU idle, without a VM or Xorg', True),
             ('cuda', 'CUDA without Xorg', 'Compute', 'NVIDIA + UVM for CUDA; desktop stays on the primary GPU', True),
             ('xorg', 'Xorg', 'Host gaming', 'NVIDIA PRIME; desktop stays on the primary GPU', True)]
+    if wayland_active():
+        rows[1:] = [('cuda', 'Wayland / CUDA', 'Host GPU', 'NVIDIA rendering and CUDA; compositor chooses its GPU', True)]
     states = {'running': 'running', 'shut off': 'shut off', 'paused': 'paused', 'in shutdown': 'shutting down'}
     for d in sorted(records, key=lambda d: (not d.get('prepared', d.get('optional', False)), d['name'].casefold())):
         info = states.get(d['state'], d['state'])
@@ -815,6 +875,8 @@ def operation_plan(target, records, xorg_attached):
         stops.append(selected)
     if any(d['state'] != 'running' for d in stops):
         raise Error('First shut down the paused or transitioning GPU-owning VM manually.')
+    if wayland_active():
+        return stops, target not in ('cuda', 'xorg') and (pci_driver(GPU) == 'nvidia' or bool(stops))
     return stops, (target == 'xorg' and not xorg_attached) or (target != 'xorg' and xorg_attached)
 
 
@@ -836,7 +898,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False, setup_dri
         operation_status(h, job, 'done', 'GPU attached to VM ' + domain['name'] + ('. ' + detail if detail else ''), target)
     # Every libvirt operation below occurs outside the shared GPU lock.
     try:
-        h.assert_x11()
+        h.assert_display()
         records = inventory()
         attached = bool(xorg_owners(h))
         stops, needs_restart = operation_plan(target, records, attached)
@@ -877,19 +939,20 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False, setup_dri
         if any(d['uuid'] != target for d in owners):
             raise Error('A VM owns the GPU again; switching has stopped.')
         if not owners:
+            wayland = wayland_active()
             gaming = target == 'xorg'
-            if (h.xorg_mode() != ('on' if gaming else 'off') or bool(xorg_owners(h)) != gaming) and not restart:
+            if not wayland and (h.xorg_mode() != ('on' if gaming else 'off') or bool(xorg_owners(h)) != gaming) and not restart:
                 raise Error('Xorg state changed; confirm graphical logout before retrying.')
-            worker('connect' if gaming else 'disconnect', preserve_policy=True)
+            worker('connect' if gaming or (wayland and target == 'cuda') else 'disconnect', preserve_policy=True, allow_logout=restart)
             if target in ('cuda', 'xorg'):
                 with locked(h):
-                    if target == 'cuda':
+                    if target == 'cuda' and not wayland:
                         restore_host(h)
                         h.run('/usr/sbin/modprobe', 'nvidia_uvm')
                         if not h.module_loaded('nvidia_uvm') or h.xorg_mode() != 'off' or xorg_owners(h):
                             raise Error('CUDA mode could not be verified; check UVM and Xorg ownership.')
                     h.choose_target(target)
-                operation_status(h, job, 'done', 'GPU attached to ' + ('Xorg. Sign in again to launch games.' if gaming else 'CUDA without Xorg.'), target)
+                operation_status(h, job, 'done', 'GPU attached to ' + ('Wayland / CUDA.' if wayland else 'Xorg. Sign in again to launch games.' if gaming else 'CUDA without Xorg.'), target)
                 return
             if current is None or current['state'] != 'running':
                 with locked(h):
@@ -923,7 +986,7 @@ def select_destination(target, job, shutdown, restart, prepare_vm=False, setup_d
     if os.geteuid() != 0:
         raise Error('Use the GUI authorization dialog or run select as administrator.')
     h = load_hook()
-    h.assert_x11()
+    h.assert_display()
     ensure_integration(vm=target not in ('none', 'xorg', 'cuda'))
     args = program_command('--selection-worker', target, '--job-id', job)
     if prepare_vm:
@@ -991,6 +1054,8 @@ def configure_gui_style(root):
 
 
 def row_summary(row, current=None):
+    if row[0] == 'cuda' and wayland_active():
+        return 'Current · Wayland / CUDA' if current == 'cuda' else 'NVIDIA rendering and CUDA'
     summaries = {'none': 'VFIO, unattached', 'cuda': 'NVIDIA + UVM, no Xorg',
                  'xorg': 'PRIME, primary desktop GPU'}
     if row[0] == current and current in summaries:
@@ -1212,7 +1277,7 @@ class GPUWindow:
             try:
                 records = inventory(check_drivers=True)
                 h, driver = load_hook(), pci_driver(GPU)
-                attached = driver == 'nvidia' and not h.shared_nvidia_driver() and bool(nvidia_provider(providers()))
+                attached = not wayland_active() and driver == 'nvidia' and not h.shared_nvidia_driver() and bool(nvidia_provider(providers()))
                 self.messages.put(('inventory', records, attached, driver, h.module_loaded('nvidia_uvm')))
             except Exception as exc:
                 self.messages.put(('error', str(exc)))
@@ -1230,7 +1295,7 @@ class GPUWindow:
             self.current.set('Current attachment: Xorg — NVIDIA gaming, desktop on the primary GPU')
             current = 'xorg'
         elif driver == 'nvidia':
-            self.current.set('Current attachment: ' + ('CUDA without Xorg — desktop on the primary GPU' if uvm else 'host NVIDIA — CUDA UVM not loaded'))
+            self.current.set('Current attachment: ' + ('Wayland / CUDA — host GPU available' if wayland_active() and uvm else 'CUDA without Xorg — desktop on the primary GPU' if uvm else 'host NVIDIA — CUDA UVM not loaded'))
             current = 'cuda'
         else:
             self.current.set('Current attachment: ' + ('none — idle GPU on VFIO' if driver == 'vfio-pci' else 'host; not attached to Xorg'))
@@ -1391,7 +1456,7 @@ def gui():
     import tkinter as tk
     if os.geteuid() == 0:
         raise Error('Open the window as your normal user, without sudo.')
-    load_hook().assert_x11(need_display=True)
+    load_hook().assert_display(need_display=True)
     root = tk.Tk()
     GPUWindow(root)
     root.mainloop()
@@ -1782,7 +1847,7 @@ def install(argv):
     if os.geteuid() != 0 and not args.dry_run:
         raise Error('Install with sudo /usr/bin/python3 -I ./nvidia-handoff --install')
     h = load_core(trusted=False)
-    h.assert_x11()
+    h.assert_display()
     if not Path('/run/systemd/system').is_dir():
         raise Error('This installer requires Debian with systemd/logind.')
     for command in ('modprobe', 'modinfo', 'systemctl', 'systemd-run', 'loginctl', 'udevadm'):
@@ -1897,7 +1962,7 @@ def main(argv):
         return install(argv[1:])
     if argv[:1] == ['--probe']:
         h = load_core(trusted=False)
-        h.assert_x11()
+        h.assert_display()
         print(json.dumps(h.discover(argv[1] if len(argv) > 1 else None), indent=2))
         return
     gpu = manager = None
@@ -1965,7 +2030,7 @@ def main(argv):
         fn = selection_worker if args.mode == 'worker' else select_destination
         return fn(args.target, job, args.shutdown_owner, args.restart_session, args.prepare_vm, args.setup_driver)
     if len(argv) == 2 and argv[0] == '--worker' and argv[1] in ('connect', 'disconnect'):
-        return worker(argv[1])
+        return worker(argv[1], allow_logout=True)
     if argv[:1] == ['run']:
         return launch(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

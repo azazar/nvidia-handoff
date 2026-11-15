@@ -22,7 +22,7 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 
 - Debian with systemd/logind, system Python 3, and the proprietary NVIDIA driver. CUDA mode requires NVIDIA UVM.
 - A secondary, non-boot NVIDIA GPU with no connected display, plus a separate primary GPU for the desktop.
-- An X11 desktop and login screen. X.Org and XLibre are supported with compatible NVIDIA drivers; Wayland and Xwayland are unsupported.
+- An X11 or Wayland desktop with compatible NVIDIA drivers. X.Org and XLibre are supported; the Tk GUI needs Xwayland on a Wayland desktop. Native Wayland applications can be launched from the CLI.
 - Tkinter for the GUI; `lspci`, kmod tools, `udevadm`, systemd tools, and `pkexec` with a desktop authentication agent.
 - For automatic VM setup: libvirt, `virsh`, `qemu:///system`, isolated IOMMU groups, and a persistent x86_64 QEMU/KVM q35 or i440fx guest running Debian 12 or 13 (amd64). The guest must already have `qemu-guest-agent` installed, enabled, and permitted to run guest commands. Missing guest hardware/channel configuration is prepared automatically; the guest agent itself cannot be installed without an existing access method.
 - Guest Docker setup also requires system Python 3 and an active rootful `docker.service` using `/etc/docker/daemon.json` and `/run/docker.sock`. Rootless Docker, custom configuration paths and runtime flags require manual setup.
@@ -129,6 +129,14 @@ To attach to a running VM, select it and click **Connect**. Missing preparation 
 
 Fresh boot requires any managed save state to be resumed or removed explicitly in virt-manager first. Both VM names and UUIDs are accepted.
 
+## Wayland
+
+On Wayland, the GUI combines host rendering and compute into **Wayland / CUDA**. It restores the NVIDIA driver and loads DRM and UVM. `run -- APPLICATION` sets NVIDIA offload variables without requiring an Xorg provider; the compositor and application control their rendering choices.
+
+Switching a host-bound GPU to idle or a VM requests logout confirmation. The worker stops the detected login manager, applies the Xorg exclusion policy for any X11 greeter, parks the GPU using the normal busy checks and rollback, then starts the login manager again. The selected VM receives the parked GPU afterward. A transfer between VMs can also require logout because stopping the first guest restores host bindings. CLI switching requires `--restart-session` for these transitions.
+
+Other sessions or services may still hold the GPU after logout. In that case the operation refuses the detach, retains its recovery interlock, and starts the login manager again. It never force-unbinds the compositor. No compositor-specific configuration is installed. Wayland detection and switching have automated regression coverage; live logout/passthrough has not yet been validated on this host.
+
 ## Host gaming and status
 
 ```sh
@@ -138,7 +146,7 @@ Fresh boot requires any managed save state to be resumed or removed explicitly i
 /opt/nvidia-handoff run -- YOUR_GAME_COMMAND
 ```
 
-`connect` enables the Xorg gaming mode; `disconnect` returns Xorg to the primary GPU. These transitions restart the detected display manager and end graphical sessions. Save your work before using `--restart-session`, then sign in again and launch games as your normal user.
+On X11, `connect` enables the Xorg gaming mode; `disconnect` returns Xorg to the primary GPU. These transitions restart the detected display manager and end graphical sessions. Save your work before using `--restart-session`, then sign in again and launch games as your normal user.
 
 ### Chrome and Chromium
 

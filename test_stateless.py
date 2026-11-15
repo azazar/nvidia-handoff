@@ -23,6 +23,7 @@ class StatelessTests(unittest.TestCase):
     def setUp(self):
         self.core = module('nvidia_handoff_core.py')
         self.app = module('nvidia-handoff')
+        self.app.wayland_active = Mock(return_value=False)
         self.app.tag_guest_driver = Mock()
         self.app.setup_guest_docker = Mock(return_value='Docker skipped.')
         self.addCleanup(os.umask, os.umask(0o077))
@@ -267,7 +268,7 @@ class StatelessTests(unittest.TestCase):
         for directory in (self.root / 'etc', hook.parent, xorg.parent):
             directory.chmod(0o755)
         h = Mock()
-        h.assert_x11 = Mock()
+        h.assert_display = Mock()
         h.discover.return_value = dict(config)
         h.STATE_DIR = runtime
         h.lock.side_effect = lambda **kw: os.open(runtime / 'lock', os.O_CREAT | os.O_RDWR, 0o600)
@@ -470,6 +471,87 @@ class StatelessTests(unittest.TestCase):
         rows=self.app.destination_rows([record('Alpha',False),record('Zeta',True),record('Beta',False)])
         self.assertEqual([row[0] for row in rows[3:]], ['Zeta','Alpha','Beta'])
         self.assertTrue(all(row[4] for row in rows))
+
+    def test_wayland_detection_and_xwayland_gui(self):
+        self.core.session_records = Mock(return_value=[{'Type': 'wayland', 'State': 'active'}])
+        with patch.dict(os.environ, {'DISPLAY': ':1'}, clear=True):
+            self.assertTrue(self.core.wayland_active())
+            self.core.assert_display(need_display=True)
+        with patch.dict(os.environ, {}, clear=True):
+            self.core.assert_display()
+            with self.assertRaisesRegex(self.core.Refuse, 'Xwayland'):
+                self.core.assert_display(need_display=True)
+        self.core.session_records.return_value[0]['State'] = 'closing'
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(self.core.wayland_active())
+
+    def test_wayland_plan_and_rows(self):
+        self.app.wayland_active.return_value = True
+        self.app.pci_driver = Mock(return_value='nvidia')
+        d = dict(uuid='vm', name='vm', state='shut off', eligible=True, prepared=True, live_gpu=[], pci=True)
+        self.assertEqual(self.app.operation_plan('vm', [d], False), ([], True))
+        self.assertEqual(self.app.operation_plan('cuda', [d], False), ([], False))
+        self.app.pci_driver.return_value = 'vfio-pci'
+        self.assertEqual(self.app.operation_plan('vm', [d], False), ([], False))
+        rows = self.app.destination_rows([d])
+        self.assertNotIn('xorg', [r[0] for r in rows])
+        self.assertEqual(rows[1][1], 'Wayland / CUDA')
+
+    def test_wayland_logout_parks_before_login_screen_and_recovers_failure(self):
+        self.app.BDFS = ('gpu',)
+        h = Mock(STATE_DIR=self.root)
+        h.driver.return_value = 'nvidia'
+        h.display_manager.return_value = 'display-manager.service'
+        self.app.CONFIG = config = self.root / 'xorg.conf'
+        original = b'Section "ServerFlags"\n Option "AutoAddGPU" "on"\nEndSection\n'
+        config.write_bytes(original)
+        self.app.atomic_config = config.write_bytes
+        active, events = [], []
+        @contextlib.contextmanager
+        def lock(h):
+            self.assertFalse(active)
+            active.append(True)
+            try: yield
+            finally: active.pop()
+        self.app.locked = lock
+        def command(*args):
+            self.assertFalse(active, 'login manager call under GPU lock')
+            events.append(args[1])
+        h.run.side_effect = command
+        def park():
+            self.assertTrue(active)
+            self.assertFalse((self.root / 'xorg-transition').exists())
+            self.assertIn(b'"off"', config.read_bytes())
+            events.append('park')
+        h.park.side_effect = park
+        with self.assertRaisesRegex(self.app.Error, 'confirmed logout'):
+            self.app.wayland_worker('disconnect', h, False)
+        h.run.assert_not_called()
+        self.app.wayland_worker('disconnect', h, True)
+        self.assertEqual(events, ['stop', 'park', 'start'])
+        self.assertFalse((self.root / 'xorg-transition').exists())
+        events.clear()
+        config.write_bytes(original)
+        h.park.side_effect = self.core.Refuse('Device busy: compositor still running')
+        with self.assertRaisesRegex(self.core.Refuse, 'Device busy'):
+            self.app.wayland_worker('disconnect', h, True)
+        self.assertEqual(events, ['stop', 'start'])
+        self.assertEqual(config.read_bytes(), original)
+        self.assertTrue((self.root / 'xorg-transition').exists())
+
+    def test_wayland_launcher_does_not_require_xrandr_provider(self):
+        self.app.wayland_active.return_value = True
+        self.app.require_stopped = Mock()
+        self.app.pci_driver = Mock(return_value='nvidia')
+        h = Mock()
+        h.shared_nvidia_driver.return_value = False
+        self.app.load_hook = lambda: h
+        self.app.providers = Mock(side_effect=AssertionError('Xrandr called'))
+        with patch.object(os, 'geteuid', return_value=1000), patch.dict(os.environ, {}, clear=True), patch.object(os, 'execvp') as launch:
+            self.app.launch(['--', 'example-app'])
+            launch.assert_called_once_with('example-app', ['example-app'])
+            self.assertEqual(os.environ['__NV_PRIME_RENDER_OFFLOAD'], '1')
+            self.assertNotIn('__NV_PRIME_RENDER_OFFLOAD_PROVIDER', os.environ)
 
     def test_operation_plan_requires_shutdown_only_for_missing_live_capacity(self):
         self.configure_guest_devices()
@@ -722,7 +804,7 @@ class StatelessTests(unittest.TestCase):
     def switching_fixture(self, record):
         self.configure_guest_devices()
         h, active = Mock(), []
-        h.assert_x11 = Mock()
+        h.assert_display = Mock()
         h.xorg_mode.return_value = 'off'
         h.driver.return_value = 'vfio-pci'
         h.load.return_value = None
@@ -764,7 +846,7 @@ class StatelessTests(unittest.TestCase):
             self.app.prepare_vm_definition, self.app.start_optional, self.app.setup_guest_driver = prepare, start, driver
             self.app.selection_worker('vm', 'job', False, False, True, True)
             self.assertEqual(events, ['prepare', 'start', 'driver'])
-            h.assert_x11.side_effect = self.core.Refuse('Wayland')
+            h.assert_display.side_effect = self.core.Refuse('Wayland')
             with self.assertRaisesRegex(self.core.Refuse, 'Wayland'):
                 self.app.selection_worker('vm', 'job', False, False)
             self.assertEqual(self.app.operation_status.call_args.args[2], 'error')
@@ -977,7 +1059,7 @@ class StatelessTests(unittest.TestCase):
         h.STATE_DIR = self.root
         before = dict(drivers=dict(h.HOST), overrides={self.gpu: ''}, modules=['nvidia_drm'])
         state = dict(before=before, host=before, persistence=False, gates=[])
-        h.topology = h.assert_x11 = h.write = h.ungate = h.log = Mock()
+        h.topology = h.assert_display = h.write = h.ungate = h.log = Mock()
         h.driver = lambda b: 'nvidia'
         h.module_loaded = lambda m: False
         h.run, h.bind = Mock(), Mock()
