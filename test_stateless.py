@@ -95,8 +95,8 @@ class StatelessTests(unittest.TestCase):
         p.chmod(0o644)
         before = p.read_bytes()
         with self.owned_paths():
-            with self.assertRaisesRegex(self.core.Refuse, 'Preserving administrator'):
-                self.core.xorg_path()
+            self.assertEqual(self.core.xorg_path(), str(folder / '90-nvidia-handoff.conf'))
+            self.assertEqual(p.read_bytes(), before)
             p.write_bytes(self.app.marked(before, original='off'))
             self.assertEqual(self.core.xorg_path(), str(p))
             with patch.object(self.core.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)):
@@ -104,6 +104,21 @@ class StatelessTests(unittest.TestCase):
                     self.core.xorg_path()
             p.write_bytes(before)
         self.assertEqual(p.read_bytes(), before)
+
+    def test_owned_dropin_overrides_earlier_policy_without_adopting_it(self):
+        self.core.Path = self.mapped_path
+        folder = self.root / 'etc/X11/xorg.conf.d'
+        folder.mkdir(parents=True)
+        original = folder / '10-no-auto-gpu.conf'
+        original.write_bytes(self.app.XORG_OFF)
+        owned = folder / '90-nvidia-handoff.conf'
+        owned.write_bytes(self.app.marked(self.app.XORG_OFF.replace(b'"off"', b'"on"')))
+        with self.owned_paths():
+            self.assertEqual(self.core.xorg_path(), str(owned))
+            self.assertEqual(original.read_bytes(), self.app.XORG_OFF)
+            original.rename(folder / '99-admin.conf')
+            with self.assertRaisesRegex(self.core.Refuse, 'would override'):
+                self.core.xorg_path()
 
     def test_wayland_host_setup_creates_no_xorg_policy(self):
         self.app.CONFIG = self.root / 'missing-xorg-policy'

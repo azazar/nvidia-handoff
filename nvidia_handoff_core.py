@@ -791,7 +791,7 @@ def native_driver(p):
 
 
 def xorg_path():
-    candidates = []
+    candidates, inherited = [], []
     for path in [Path('/etc/X11/xorg.conf'), *Path('/etc/X11/xorg.conf.d').glob('*.conf')]:
         if not path.exists():
             continue
@@ -800,9 +800,15 @@ def xorg_path():
             raise Refuse('Unsafe Xorg configuration: ' + str(path))
         data = path.read_bytes()
         if re.search(rb'(?im)^\s*Option\s+"AutoAddGPU"', data) or b'nvidia-handoff sha256=' in data:
-            if path.parent != Path('/etc/X11/xorg.conf.d') or b'nvidia-handoff sha256=' not in data:
-                raise Refuse('Preserving administrator Xorg policy: ' + str(path) +
-                             '; resolve AutoAddGPU conflicts before creating a handoff drop-in')
+            if path.parent != Path('/etc/X11/xorg.conf.d'):
+                raise Refuse('Preserving administrator Xorg policy: ' + str(path))
+            if b'nvidia-handoff sha256=' not in data:
+                # A later owned ServerFlags drop-in may override a simple earlier policy.
+                plain = re.sub(rb'(?m)#.*$', b'', data)
+                if not re.fullmatch(rb'\s*Section\s+"ServerFlags"\s+Option\s+"AutoAddGPU"\s+"(?:on|off)"\s+EndSection\s*', plain, re.I):
+                    raise Refuse('Preserving administrator Xorg policy: ' + str(path))
+                inherited.append(path)
+                continue
             owner = subprocess.run(['/usr/bin/dpkg-query', '--search', str(path)],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
             if owner.returncode != 1:
@@ -810,7 +816,10 @@ def xorg_path():
             candidates.append(path)
     if len(candidates) > 1:
         raise Refuse('Multiple AutoAddGPU policies found; resolve them before switching')
-    return str(candidates[0] if candidates else Path('/etc/X11/xorg.conf.d/90-nvidia-handoff.conf'))
+    chosen = candidates[0] if candidates else Path('/etc/X11/xorg.conf.d/90-nvidia-handoff.conf')
+    if any(p.name >= chosen.name for p in inherited):
+        raise Refuse('An administrator Xorg policy would override the handoff drop-in')
+    return str(chosen)
 
 
 def runtime_path(gpu, devices):
