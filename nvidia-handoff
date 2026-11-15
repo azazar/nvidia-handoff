@@ -1492,10 +1492,15 @@ def application_launcher(remove=False, dry_run=False):
     configured = os.environ.get('XDG_DATA_HOME')
     if configured and Path(configured) != data:
         raise Error('The managed launcher requires the standard ~/.local/share application directory.')
+    icon = 'icons/hicolor/scalable/apps/nvidia-handoff.svg'
+    icon_path = str(data / icon)
+    for char, escaped in (('\\', r'\\'), ('\n', r'\n'), ('\r', r'\r'), ('\t', r'\t')):
+        icon_path = icon_path.replace(char, escaped)
+    launcher = LAUNCHER.replace(b'Icon=nvidia-handoff', ('Icon=' + icon_path).encode())
     files = []
     for relative, content in (
-            ('applications/nvidia-handoff.desktop', LAUNCHER),
-            ('icons/hicolor/scalable/apps/nvidia-handoff.svg', LAUNCHER_ICON)):
+            ('applications/nvidia-handoff.desktop', launcher),
+            (icon, LAUNCHER_ICON)):
         path = data / relative
         parent = path.parent.resolve()
         if not parent.is_relative_to(home):
@@ -1505,7 +1510,7 @@ def application_launcher(remove=False, dry_run=False):
             raise Error('Refusing a symlink in the launcher path: ' + str(path))
         exists = path.exists()
         legacy = LAUNCHER.replace(b'Icon=nvidia-handoff', b'Icon=video-display')
-        accepted = (content, legacy) if content == LAUNCHER else (content,)
+        accepted = (content, LAUNCHER, legacy) if content == launcher else (content,)
         if exists and (not path.is_file() or path.stat().st_uid != os.getuid() or path.read_bytes() not in accepted):
             raise Error('Preserving a customized or unowned launcher file: ' + str(path))
         files.append((path, content, exists))

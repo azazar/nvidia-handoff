@@ -525,8 +525,8 @@ class StatelessTests(unittest.TestCase):
                 self.app.main(['--create-launcher', '--dry-run'])
             self.assertFalse(target.parent.exists())
             self.app.application_launcher()
-            self.assertEqual(target.read_bytes(), self.app.LAUNCHER)
             icon = self.root / '.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg'
+            self.assertEqual(target.read_bytes(), self.app.LAUNCHER.replace(b'Icon=nvidia-handoff', ('Icon=' + str(icon)).encode()))
             self.assertEqual(icon.read_bytes(), self.app.LAUNCHER_ICON)
             self.app.ET.fromstring(icon.read_bytes())
             if Path('/usr/bin/desktop-file-validate').exists():
@@ -562,10 +562,12 @@ class StatelessTests(unittest.TestCase):
         with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {}, clear=True), patch.object(os, 'geteuid', return_value=1000), patch.object(os, 'access', return_value=True):
             self.app.application_launcher()
             target = home / '.local/share/applications/nvidia-handoff.desktop'
-            target.write_bytes(self.app.LAUNCHER.replace(b'Icon=nvidia-handoff', b'Icon=video-display'))
-            self.app.application_launcher()
-            self.assertEqual(target.read_bytes(), self.app.LAUNCHER)
             icon = home / '.local/share/icons/hicolor/scalable/apps/nvidia-handoff.svg'
+            expected = self.app.LAUNCHER.replace(b'Icon=nvidia-handoff', ('Icon=' + str(icon)).encode())
+            for legacy in (self.app.LAUNCHER, self.app.LAUNCHER.replace(b'Icon=nvidia-handoff', b'Icon=video-display')):
+                target.write_bytes(legacy)
+                self.app.application_launcher()
+                self.assertEqual(target.read_bytes(), expected)
             icon.write_text('custom icon')
             with self.assertRaisesRegex(self.app.Error, 'Preserving'):
                 self.app.application_launcher(remove=True)
