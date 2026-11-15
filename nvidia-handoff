@@ -1533,6 +1533,12 @@ def application_launcher(remove=False, dry_run=False):
             with path.open('wb' if exists else 'xb') as output:
                 os.fchmod(output.fileno(), 0o644)
                 output.write(content)
+    if not dry_run and os.environ.get('DBUS_SESSION_BUS_ADDRESS') and shutil.which('dbus-send'):
+        try:
+            run('dbus-send', '--session', '--type=signal', '/KIconLoader',
+                'org.kde.KIconLoader.iconChanged', 'int32:0', timeout=5)
+        except (Error, OSError, subprocess.TimeoutExpired) as exc:
+            print('Could not refresh desktop icons: ' + str(exc), file=sys.stderr)
     action = 'remove' if remove else 'create'
     if remove and not any(exists for _, _, exists in files):
         return 'No managed launcher or icon.'

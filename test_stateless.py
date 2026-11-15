@@ -590,6 +590,22 @@ class StatelessTests(unittest.TestCase):
             with self.assertRaisesRegex(self.app.Error, 'outside your home'):
                 self.app.application_launcher()
 
+    def test_launcher_refreshes_kde_icons_without_restarting_desktop(self):
+        with patch.object(Path, 'home', return_value=self.root), patch.dict(os.environ, {'DBUS_SESSION_BUS_ADDRESS': 'unix:path=test'}, clear=True), patch.object(os, 'geteuid', return_value=1000), patch.object(os, 'access', return_value=True), patch.object(self.app.shutil, 'which', return_value='/usr/bin/dbus-send'), patch.object(self.app, 'run') as notify:
+            self.app.application_launcher(dry_run=True)
+            notify.assert_not_called()
+            self.app.application_launcher()
+            notify.assert_called_once_with('dbus-send', '--session', '--type=signal', '/KIconLoader',
+                                           'org.kde.KIconLoader.iconChanged', 'int32:0', timeout=5)
+            notify.reset_mock()
+            self.app.application_launcher(remove=True, dry_run=True)
+            notify.assert_not_called()
+            notify.side_effect = self.app.Error('Session bus unavailable')
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.app.application_launcher(remove=True)
+            self.assertIn('Could not refresh desktop icons', errors.getvalue())
+            self.assertFalse((self.root / '.local/share/applications/nvidia-handoff.desktop').exists())
+
     def test_cleanup_removes_orphaned_icon(self):
         with patch.object(Path, 'home', return_value=self.root), patch.dict(os.environ, {}, clear=True), patch.object(os, 'geteuid', return_value=1000), patch.object(os, 'access', return_value=True):
             self.app.application_launcher()
