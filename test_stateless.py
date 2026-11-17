@@ -666,12 +666,19 @@ class StatelessTests(unittest.TestCase):
         self.app.pci_driver = Mock(return_value='nvidia')
         d = dict(uuid='vm', name='vm', state='shut off', eligible=True, prepared=True, live_gpu=[], pci=True)
         self.assertEqual(self.app.operation_plan('vm', [d], False), ([], True))
-        self.assertEqual(self.app.operation_plan('cuda', [d], False), ([], False))
+        self.assertEqual(self.app.operation_plan('cuda', [d], False), ([], True))
+        self.assertEqual(self.app.operation_plan('wayland', [d], False), ([], False))
         self.app.pci_driver.return_value = 'vfio-pci'
         self.assertEqual(self.app.operation_plan('vm', [d], False), ([], False))
         rows = self.app.destination_rows([d])
-        self.assertNotIn('xorg', [r[0] for r in rows])
-        self.assertEqual(rows[1][1], 'Wayland / CUDA')
+        self.assertEqual([r[0] for r in rows[:4]], ['none', 'cuda', 'xorg', 'wayland'])
+        self.assertEqual(rows[1][1], 'CUDA only')
+        self.assertFalse(rows[2][4])
+        with self.assertRaisesRegex(self.app.Error, 'X11 session'):
+            self.app.operation_plan('xorg', [], False)
+        self.app.wayland_active.return_value = False
+        with self.assertRaisesRegex(self.app.Error, 'Wayland session'):
+            self.app.operation_plan('wayland', [], False)
 
     def test_wayland_logout_parks_before_login_screen_and_recovers_failure(self):
         self.app.BDFS = ('gpu',)
@@ -707,6 +714,10 @@ class StatelessTests(unittest.TestCase):
         self.assertEqual(events, ['stop', 'park', 'start'])
         self.assertFalse((self.root / 'xorg-transition').exists())
         events.clear()
+        self.app.enable_cuda = lambda hook: (self.assertTrue(active), events.append('cuda'))
+        self.app.wayland_worker('cuda', h, True)
+        self.assertEqual(events, ['stop', 'park', 'cuda', 'start'])
+        events.clear()
         config.write_bytes(original)
         h.park.side_effect = self.core.Refuse('Device busy: compositor still running')
         with self.assertRaisesRegex(self.core.Refuse, 'Device busy'):
@@ -714,6 +725,60 @@ class StatelessTests(unittest.TestCase):
         self.assertEqual(events, ['stop', 'start'])
         self.assertEqual(config.read_bytes(), original)
         self.assertTrue((self.root / 'xorg-transition').exists())
+
+    def test_cuda_only_releases_graphics_and_refuses_busy_or_shared_drivers(self):
+        h = Mock()
+        h.shared_nvidia_driver.return_value = False
+        h.module_loaded.return_value = True
+        h.host_nodes.return_value = h.vfio_nodes.return_value = set()
+        self.app.restore_host = Mock()
+        self.app.graphics_enabled = Mock(return_value=False)
+        self.app.xorg_owners = Mock(return_value=set())
+        self.app.enable_cuda(h)
+        self.assertEqual([c.args for c in h.run.call_args_list], [
+            ('/usr/sbin/modprobe', '-r', 'nvidia_drm'),
+            ('/usr/sbin/modprobe', '-r', 'nvidia_modeset'),
+            ('/usr/sbin/modprobe', 'nvidia_uvm')])
+        h.run.reset_mock()
+        h.idle.side_effect = self.core.Refuse('Device busy')
+        with self.assertRaisesRegex(self.core.Refuse, 'busy'):
+            self.app.enable_cuda(h)
+        h.run.assert_not_called()
+        h.idle.side_effect = None
+        h.shared_nvidia_driver.return_value = True
+        self.app.restore_host.reset_mock()
+        with self.assertRaisesRegex(self.app.Error, 'another NVIDIA'):
+            self.app.enable_cuda(h)
+        self.app.restore_host.assert_not_called()
+        h.shared_nvidia_driver.return_value = False
+        self.app.graphics_enabled.return_value = True
+        with self.assertRaisesRegex(self.app.Error, 'could not be verified'):
+            self.app.enable_cuda(h)
+
+    def test_wayland_and_cuda_dispatch_are_distinct(self):
+        d = dict(uuid='vm', name='vm', state='shut off', eligible=True, prepared=True, live_gpu=[])
+        with self.switching_fixture(d) as (h, active):
+            self.app.wayland_active.return_value = True
+            for target, mode in (('cuda', 'cuda'), ('wayland', 'connect')):
+                self.app.selection_worker(target, 'job', False, True)
+                self.app.worker.assert_called_with(mode, preserve_policy=True, allow_logout=True)
+                h.choose_target.assert_called_with(target)
+            self.app.worker.reset_mock()
+            with self.assertRaisesRegex(self.app.Error, 'permission to end'):
+                self.app.selection_worker('cuda', 'job', False, False)
+            self.app.worker.assert_not_called()
+
+    def test_graphics_detection_uses_selected_pci_device(self):
+        h = self.core
+        self.app.GPU = self.gpu
+        drm = h.SYS / 'class/drm'
+        drm.mkdir(parents=True)
+        self.assertFalse(self.app.graphics_enabled(h))
+        other = h.SYS / 'devices/other'; other.mkdir(parents=True)
+        (drm / 'card0').symlink_to(other)
+        self.assertFalse(self.app.graphics_enabled(h))
+        (drm / 'card1').symlink_to(h.pci(self.gpu))
+        self.assertTrue(self.app.graphics_enabled(h))
 
     def test_wayland_launcher_does_not_require_xrandr_provider(self):
         self.app.wayland_active.return_value = True
@@ -1080,6 +1145,14 @@ class StatelessTests(unittest.TestCase):
         for uvm in (False, True):
             self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', uvm)
             self.assertEqual(window.current_target, 'cuda' if uvm else None)
+        self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', True, True)
+        self.assertIsNone(window.current_target)
+        self.app.wayland_active.return_value = True
+        for graphics in (False, True):
+            self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', True, graphics)
+            self.assertEqual(window.current_target, 'wayland' if graphics else 'cuda')
+            self.assertIn('cuda', window.rows)
+            self.assertIn('wayland', window.rows)
 
 
 

@@ -6,7 +6,7 @@ Share a displayless secondary NVIDIA GPU between CUDA applications, host games, 
 
 ## Features
 
-- **GPU destinations:** idle, CUDA without Xorg, Xorg with NVIDIA PRIME, or a virtual machine.
+- **GPU destinations:** idle, CUDA only, Xorg with NVIDIA PRIME, Wayland rendering, or a virtual machine.
 - **Automatic Debian VM setup:** Connect prepares missing passthrough hardware and installs a hardware-matched NVIDIA driver through the QEMU guest agent. Prepared VMs appear first; unprepared VMs are listed too.
 - **Docker GPU support in Debian VMs:** guest software setup configures the NVIDIA runtime when Docker Engine is installed, preserving Docker settings and reloading without a daemon restart.
 - **Optional VM passthrough:** start a VM with or without the GPU; ordinary VM starts are GPU-free after setup.
@@ -91,7 +91,8 @@ Open from your normal X11 session:
 | Destination | Operation |
 | --- | --- |
 | None | Park the GPU idle, normally on VFIO when isolation permits |
-| CUDA without Xorg | Bind NVIDIA and load UVM for compute |
+| CUDA only | Bind NVIDIA and load UVM with NVIDIA DRM graphics disabled |
+| Wayland | Enable NVIDIA DRM rendering in a Wayland session |
 | Xorg | Enable NVIDIA PRIME for host games |
 | A VM | Prepare and connect the GPU; install missing Debian drivers |
 
@@ -153,7 +154,7 @@ Fresh boot requires any managed save state to be resumed or removed explicitly i
 
 ## Wayland
 
-On Wayland, the GUI combines host rendering and compute into **Wayland / CUDA**. It restores the NVIDIA driver and loads DRM and UVM. `run -- APPLICATION` sets NVIDIA offload variables without requiring an Xorg provider; the compositor and application control their rendering choices.
+The GUI keeps **CUDA only** and **Wayland** as separate destinations. CUDA-only loads NVIDIA/UVM and disables NVIDIA DRM and modeset with normal module unloading; it refuses busy devices and shared NVIDIA drivers. On Wayland, entering CUDA-only requires confirmed logout so graphics can be released before the login manager restarts. Wayland rendering restores NVIDIA DRM and UVM. The current destination is detected from the selected GPU’s live DRM device and driver state, not just the session type. These are runtime settings; another program loading NVIDIA DRM can make graphics available again. Xorg remains a separate destination, selectable in an X11 session. `run -- APPLICATION` sets NVIDIA offload variables without requiring an Xorg provider; the compositor and application control their rendering choices.
 
 Switching a host-bound GPU to idle or a VM requests logout confirmation. The worker stops the detected login manager, applies the Xorg exclusion policy for any X11 greeter, parks the GPU using the normal busy checks and rollback, then starts the login manager again. The selected VM receives the parked GPU afterward. A transfer between VMs can also require logout because stopping the first guest restores host bindings. CLI switching requires `--restart-session` for these transitions.
 

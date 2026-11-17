@@ -217,6 +217,24 @@ def restore_host(h):
         raise Error('Host driver binding verification failed')
 
 
+def graphics_enabled(h):
+    return any(h.beneath(p, h.pci(GPU)) for p in (h.SYS / 'class/drm').glob('card[0-9]*'))
+
+
+def enable_cuda(h):
+    if h.shared_nvidia_driver():
+        raise Error('CUDA-only mode cannot disable graphics while another NVIDIA GPU shares the driver.')
+    restore_host(h)
+    h.display_idle()
+    h.idle(h.host_nodes() | h.vfio_nodes())
+    for module in ('nvidia_drm', 'nvidia_modeset'):
+        if h.module_loaded(module):
+            h.run('/usr/sbin/modprobe', '-r', module)
+    h.run('/usr/sbin/modprobe', 'nvidia_uvm')
+    if not h.module_loaded('nvidia_uvm') or graphics_enabled(h) or xorg_owners(h):
+        raise Error('CUDA-only mode could not be verified; graphics must be released and UVM loaded.')
+
+
 def wayland_active():
     return load_hook().wayland_active()
 
@@ -229,7 +247,7 @@ def wayland_worker(mode, h, allow_logout):
             h.run('/usr/sbin/modprobe', 'nvidia_uvm')
             h.topology()
         return
-    if all(h.driver(b) in (None, 'vfio-pci') for b in BDFS) and h.xorg_mode() == 'off':
+    if mode == 'disconnect' and all(h.driver(b) in (None, 'vfio-pci') for b in BDFS) and h.xorg_mode() == 'off':
         return
     if not allow_logout:
         raise Error('Wayland handoff requires confirmed logout; add --restart-session.')
@@ -254,6 +272,8 @@ def wayland_worker(mode, h, allow_logout):
                     atomic_config(text.encode())
                 marker.unlink()  # Still locked; park performs all busy/rollback checks.
                 h.park()
+                if mode == 'cuda':
+                    enable_cuda(h)
             except BaseException:
                 marker.write_text('wayland-disconnect\n')
                 marker.chmod(0o600)
@@ -268,14 +288,14 @@ def worker(mode, preserve_policy=False, allow_logout=False):
     if os.geteuid() != 0:
         raise Error('The switch worker requires administrator authentication.')
     h = load_hook()
-    ensure_integration(xorg=not wayland_active() or mode == 'disconnect')
+    ensure_integration(xorg=not wayland_active() or mode != 'connect')
     h.assert_display()
     require_stopped()  # Libvirt query OUTSIDE the GPU lock.
     if wayland_active():
         wayland_worker(mode, h, allow_logout)
         if not preserve_policy:
             with locked(h):
-                h.choose_target('cuda' if mode == 'connect' else None)
+                h.choose_target('wayland' if mode == 'connect' else 'cuda' if mode == 'cuda' else None)
         return
     fd = h.lock()
     marker = h.STATE_DIR / 'xorg-transition'
@@ -833,10 +853,10 @@ def inventory(check_drivers=False):
 
 def destination_rows(records):
     rows = [('none', 'None', 'Idle GPU', 'Leave GPU idle, without a VM or Xorg', True),
-            ('cuda', 'CUDA without Xorg', 'Compute', 'NVIDIA + UVM for CUDA; desktop stays on the primary GPU', True),
-            ('xorg', 'Xorg', 'Host gaming', 'NVIDIA PRIME; desktop stays on the primary GPU', True)]
+            ('cuda', 'CUDA only', 'Compute', 'NVIDIA + UVM, without Xorg or Wayland graphics', True),
+            ('xorg', 'Xorg', 'Host gaming', 'NVIDIA PRIME; requires an X11 session', not wayland_active())]
     if wayland_active():
-        rows[1:] = [('cuda', 'Wayland / CUDA', 'Host GPU', 'NVIDIA rendering and CUDA; compositor chooses its GPU', True)]
+        rows.append(('wayland', 'Wayland', 'Host gaming', 'NVIDIA DRM rendering; compositor chooses its GPU', True))
     states = {'running': 'running', 'shut off': 'shut off', 'paused': 'paused', 'in shutdown': 'shutting down'}
     for d in sorted(records, key=lambda d: (not d.get('prepared', d.get('optional', False)), d['name'].casefold())):
         info = states.get(d['state'], d['state'])
@@ -862,8 +882,12 @@ def destination_rows(records):
 
 
 def operation_plan(target, records, xorg_attached):
+    if target == 'xorg' and wayland_active():
+        raise Error('Xorg destination requires an X11 session; select Wayland for Wayland rendering.')
+    if target == 'wayland' and not wayland_active():
+        raise Error('Wayland destination requires a Wayland session.')
     selected = next((d for d in records if d['uuid'] == target), None)
-    if target not in ('none', 'xorg', 'cuda') and (selected is None or not selected['eligible']):
+    if target not in ('none', 'xorg', 'cuda', 'wayland') and (selected is None or not selected['eligible']):
         raise Error('Automatic setup requires a persistent x86_64 QEMU/KVM q35 or i440fx VM.')
     owners = [d for d in records if d['live_gpu']]
     if selected and selected['live_gpu'] and set(selected['live_gpu']) == set(BDFS):
@@ -874,7 +898,7 @@ def operation_plan(target, records, xorg_attached):
     if any(d['state'] != 'running' for d in stops):
         raise Error('First shut down the paused or transitioning GPU-owning VM manually.')
     if wayland_active():
-        return stops, target not in ('cuda', 'xorg') and (pci_driver(GPU) == 'nvidia' or bool(stops))
+        return stops, target != 'wayland' and (target == 'cuda' or pci_driver(GPU) == 'nvidia' or bool(stops))
     return stops, (target == 'xorg' and not xorg_attached) or (target != 'xorg' and xorg_attached)
 
 
@@ -941,16 +965,13 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False, setup_dri
             gaming = target == 'xorg'
             if not wayland and (h.xorg_mode() != ('on' if gaming else 'off') or bool(xorg_owners(h)) != gaming) and not restart:
                 raise Error('Xorg state changed; confirm graphical logout before retrying.')
-            worker('connect' if gaming or (wayland and target == 'cuda') else 'disconnect', preserve_policy=True, allow_logout=restart)
-            if target in ('cuda', 'xorg'):
+            worker('connect' if gaming or target == 'wayland' else 'cuda' if wayland and target == 'cuda' else 'disconnect', preserve_policy=True, allow_logout=restart)
+            if target in ('cuda', 'xorg', 'wayland'):
                 with locked(h):
                     if target == 'cuda' and not wayland:
-                        restore_host(h)
-                        h.run('/usr/sbin/modprobe', 'nvidia_uvm')
-                        if not h.module_loaded('nvidia_uvm') or h.xorg_mode() != 'off' or xorg_owners(h):
-                            raise Error('CUDA mode could not be verified; check UVM and Xorg ownership.')
+                        enable_cuda(h)
                     h.choose_target(target)
-                operation_status(h, job, 'done', 'GPU attached to ' + ('Wayland / CUDA.' if wayland else 'Xorg. Sign in again to launch games.' if gaming else 'CUDA without Xorg.'), target)
+                operation_status(h, job, 'done', 'GPU attached to ' + ('Wayland.' if target == 'wayland' else 'Xorg. Sign in again to launch games.' if gaming else 'CUDA only.'), target)
                 return
             if current is None or current['state'] != 'running':
                 with locked(h):
@@ -977,7 +998,7 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False, setup_dri
 
 
 def select_destination(target, job, shutdown, restart, prepare_vm=False, setup_driver=False):
-    if target not in ('none', 'xorg', 'cuda') and str(uuid.UUID(target)) != target:
+    if target not in ('none', 'xorg', 'cuda', 'wayland') and str(uuid.UUID(target)) != target:
         raise Error('Invalid target UUID')
     if str(uuid.UUID(job)) != job:
         raise Error('Invalid operation ID')
@@ -985,8 +1006,8 @@ def select_destination(target, job, shutdown, restart, prepare_vm=False, setup_d
         raise Error('Use the GUI authorization dialog or run select as administrator.')
     h = load_hook()
     h.assert_display()
-    ensure_integration(vm=target not in ('none', 'xorg', 'cuda'),
-                       xorg=not wayland_active() or target not in ('cuda', 'xorg'))
+    ensure_integration(vm=target not in ('none', 'xorg', 'cuda', 'wayland'),
+                       xorg=not wayland_active() or target != 'wayland')
     args = program_command('--selection-worker', target, '--job-id', job)
     if prepare_vm:
         args.append('--prepare-vm')
@@ -1045,7 +1066,7 @@ def configure_gui_style(root):
     style.configure('Handoff.TButton', font=body, padding=(px(12), px(7)))
     style.configure('Handoff.Vertical.TScrollbar', arrowsize=px(14), width=px(16))
     style.configure('Handoff.Horizontal.TScrollbar', arrowsize=px(14), width=px(16))
-    columns = (max(px(190), body.measure('CUDA without Xorg') + px(32)),
+    columns = (max(px(190), body.measure('CUDA only') + px(32)),
                max(px(190), body.measure('Virtual machine') + px(32)),
                max(px(310), heading.measure('Status / attachment') + px(32),
                    body.measure('PRIME, primary desktop GPU') + px(32)))
@@ -1053,13 +1074,11 @@ def configure_gui_style(root):
 
 
 def row_summary(row, current=None):
-    if row[0] == 'cuda' and wayland_active():
-        return 'Current · Wayland / CUDA' if current == 'cuda' else 'NVIDIA rendering and CUDA'
-    summaries = {'none': 'VFIO, unattached', 'cuda': 'NVIDIA + UVM, no Xorg',
+    summaries = {'none': 'VFIO, unattached', 'cuda': 'NVIDIA + UVM, no graphics', 'wayland': 'NVIDIA DRM rendering',
                  'xorg': 'PRIME, primary desktop GPU'}
     if row[0] == current and current in summaries:
         return {'none': 'Current · idle GPU', 'cuda': 'GPU attached · CUDA',
-                'xorg': 'GPU attached · Xorg'}[current]
+                'xorg': 'GPU attached · Xorg', 'wayland': 'GPU attached · Wayland'}[current]
     if row[0] in summaries:
         return summaries[row[0]]
     if not row[4]:
@@ -1278,12 +1297,12 @@ class GPUWindow:
                 records = inventory(check_drivers=True)
                 h, driver = load_hook(), pci_driver(GPU)
                 attached = not wayland_active() and driver == 'nvidia' and not h.shared_nvidia_driver() and bool(nvidia_provider(providers()))
-                self.messages.put(('inventory', records, attached, driver, h.module_loaded('nvidia_uvm')))
+                self.messages.put(('inventory', records, attached, driver, h.module_loaded('nvidia_uvm'), graphics_enabled(h)))
             except Exception as exc:
                 self.messages.put(('error', str(exc)))
         threading.Thread(target=fetch, daemon=True).start()
 
-    def show_inventory(self, records, attached, driver, uvm=False):
+    def show_inventory(self, records, attached, driver, uvm=False, graphics=False):
         self.refreshing = False
         self.records = records
         self.attached = attached
@@ -1295,15 +1314,15 @@ class GPUWindow:
             self.current.set('Current attachment: Xorg — NVIDIA gaming, desktop on the primary GPU')
             current = 'xorg'
         elif driver == 'nvidia':
-            self.current.set('Current attachment: ' + ('Wayland / CUDA — host GPU available' if wayland_active() and uvm else 'CUDA without Xorg — desktop on the primary GPU' if uvm else 'host NVIDIA — CUDA UVM not loaded'))
-            current = 'cuda'
+            current = 'wayland' if wayland_active() and graphics else 'host' if graphics else 'cuda'
+            self.current.set('Current attachment: ' + ('Wayland — NVIDIA graphics available' if current == 'wayland' else 'host NVIDIA — graphics enabled' if graphics else 'CUDA only' if uvm else 'host NVIDIA — CUDA UVM not loaded'))
         else:
             self.current.set('Current attachment: ' + ('none — idle GPU on VFIO' if driver == 'vfio-pci' else 'host; not attached to Xorg'))
             current = 'none'
         self.current_target = current
         if owners and (set(owners[0]['live_gpu']) != set(BDFS) or owners[0].get('driver_ready') is False):
             self.current_target = None
-        elif (current == 'cuda' and not uvm) or (current == 'none' and driver not in ('vfio-pci', 'unbound')):
+        elif current == 'host' or (current == 'cuda' and not uvm) or (current == 'none' and driver not in ('vfio-pci', 'unbound')):
             self.current_target = None
         previous = self.tree.selection()
         chosen = previous[0] if previous else current

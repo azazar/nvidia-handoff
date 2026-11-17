@@ -22,7 +22,7 @@ These rules preserve the user's requested behavior and lessons from previous fix
 - Never bypass a busy check by force-unbinding Xorg's NVIDIA device, forcing module removal, resetting/removing/rescanning PCI devices, killing workloads, or disabling checks. A previous busy Xorg unbind caused a kernel oops.
 - Treat all selected GPU PCI functions as a transaction. Roll back partial host detach; preserve recovery state if rollback cannot complete. Never erase interlocks or state just to make an operation proceed.
 - Do not globally stop audio services or disable unrelated sound cards to free HDMI audio. Limit any audio rule to this displayless GPU, handle the installed WirePlumber format, and explain when a session restart is required to apply it.
-- Support X.Org and XLibre through X11, with compatible drivers. Detect and refuse Wayland/Xwayland and active Wayland greeters for GPU switching. Discover the active login manager; do not assume LightDM, GDM, SDDM, or XFCE.
+- Support X.Org and XLibre through X11, with compatible drivers. Keep CUDA-only, Xorg, and Wayland as distinct destinations. CUDA-only must not expose NVIDIA DRM graphics; Wayland graphics release requires confirmed logout and the same busy checks. Do not infer GPU graphics attachment merely from an active Wayland session. Discover the active login manager; do not assume LightDM, GDM, SDDM, or XFCE.
 - Xorg mode changes can end graphical sessions: require explicit permission for that transition. Keep the primary GPU responsible for the desktop. Never interrupt running VMs or rebind their GPU while installing or updating the program.
 
 ## Libvirt, locks, and VM lifecycle

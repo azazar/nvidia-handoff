@@ -238,7 +238,7 @@ def policy_target():
     if not path.exists():
         return None
     target = json.loads(path.read_text())['target']
-    if target not in ('none', 'xorg', 'cuda', 'blocked'):
+    if target not in ('none', 'xorg', 'cuda', 'wayland', 'blocked'):
         if str(uuid.UUID(target)) != target:
             raise Refuse('Invalid destination policy')
     return target
@@ -248,7 +248,7 @@ def choose_target(target):
     if target is None:
         (STATE_DIR / 'destination.json').unlink(missing_ok=True)
     else:
-        if target not in ('none', 'xorg', 'cuda', 'blocked') and str(uuid.UUID(target)) != target:
+        if target not in ('none', 'xorg', 'cuda', 'wayland', 'blocked') and str(uuid.UUID(target)) != target:
             raise Refuse('Invalid destination policy')
         atomic_json(STATE_DIR / 'destination.json', {'target': target})
 
