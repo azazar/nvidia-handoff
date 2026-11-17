@@ -91,7 +91,7 @@ Open from your normal X11 session:
 | Destination | Operation |
 | --- | --- |
 | None | Park the GPU idle, normally on VFIO when isolation permits |
-| CUDA only | Bind NVIDIA and load UVM with NVIDIA DRM graphics disabled |
+| CUDA only | Enable NVIDIA/UVM for compute and keep desktop EGL/GLX/Vulkan on the primary GPU |
 | Wayland | Enable NVIDIA DRM rendering in a Wayland session |
 | Xorg | Enable NVIDIA PRIME for host games |
 | A VM | Prepare and connect the GPU; install missing Debian drivers |
@@ -154,7 +154,11 @@ Fresh boot requires any managed save state to be resumed or removed explicitly i
 
 ## Wayland
 
-The GUI keeps **CUDA only** and **Wayland** as separate destinations. CUDA-only loads NVIDIA/UVM and disables NVIDIA DRM and modeset with normal module unloading; it refuses busy devices and shared NVIDIA drivers. On Wayland, entering CUDA-only requires confirmed logout so graphics can be released before the login manager restarts. Wayland rendering restores NVIDIA DRM and UVM. The current destination is detected from the selected GPU’s live DRM device and driver state, not just the session type. These are runtime settings; another program loading NVIDIA DRM can make graphics available again. Xorg remains a separate destination, selectable in an X11 session. `run -- APPLICATION` sets NVIDIA offload variables without requiring an Xorg provider; the compositor and application control their rendering choices.
+The GUI keeps **CUDA only** and **Wayland** as separate destinations. CUDA-only selects Mesa EGL/GLX and the primary AMD or Intel Vulkan driver for desktop applications while leaving NVIDIA CUDA available. It discovers the primary PCI GPU and installed graphics manifests; an ambiguous or unsupported primary GPU is refused. This is desktop graphics policy, not an access-control boundary: applications that deliberately override their graphics environment can bypass it.
+
+The policy uses two owned drop-ins: `/etc/environment.d/90-nvidia-handoff.conf` and `/etc/systemd/system/display-manager.service.d/90-nvidia-handoff.conf`. The latter reads the former, so the login manager and systemd user services receive the same settings. Only previous values of the affected user-manager variables are retained for restoration; unrelated environment variables are untouched. Leaving CUDA-only removes the drop-ins and restores unchanged managed values. Cleanup removes them too. Packaged files are never edited.
+
+Entering or leaving this policy requires confirmed graphical logout so existing graphics processes restart with the correct environment. Logging out may stop user applications and their CUDA workers. NVIDIA DRM need not be unloaded, and CUDA setup does not forcibly detach a busy GPU. Wayland rendering enables NVIDIA DRM/UVM; Xorg remains a separate destination for an X11 session. `run -- APPLICATION` refuses while CUDA-only policy is active; select Wayland or Xorg first. Current status reports the active policy rather than assuming unloaded DRM guarantees compute-only use.
 
 Switching a host-bound GPU to idle or a VM requests logout confirmation. The worker stops the detected login manager, applies the Xorg exclusion policy for any X11 greeter, parks the GPU using the normal busy checks and rollback, then starts the login manager again. The selected VM receives the parked GPU afterward. A transfer between VMs can also require logout because stopping the first guest restores host bindings. CLI switching requires `--restart-session` for these transitions.
 
@@ -195,7 +199,7 @@ Use `chromium` instead of `google-chrome` for Chromium. Check `chrome://gpu` for
 | `/run/nvidia-handoff/<BDF>/` | Locking, recovery state, and destination policy |
 | `/run/user/<UID>/nvidia-handoff-<JOB_UUID>.json` | GUI operation progress |
 
-Integration files are created for the relevant setup or switching action. Wayland host-only setup creates no Xorg policy. Xorg switching uses marked, tool-owned files under `xorg.conf.d`; a simple earlier ServerFlags AutoAddGPU drop-in is left intact and overridden by the later owned file. Conflicting later policies, complex administrator policies, and a marked main `xorg.conf` are preserved and reported for manual review. These are default paths; existing owned Xorg drop-ins, owned hooks, and migrated recovery directories are discovered in place. Integration comments contain content hashes and the original Xorg setting for safe cleanup; they do not cache hardware or ownership status. GUI refresh and status inspection are read-only. Current attachment comes from live VM definitions, device bindings, and X11 state. Temporary locks, rollback records, and destination policy under `/run` protect handoffs; they are not a replacement hardware/status database. Switching jobs run in a transient systemd unit.
+Integration files are created for the relevant setup or switching action. Wayland host-only setup creates no Xorg policy. Xorg switching uses marked, tool-owned files under `xorg.conf.d`; a simple earlier ServerFlags AutoAddGPU drop-in is left intact and overridden by the later owned file. Conflicting later policies, complex administrator policies, and a marked main `xorg.conf` are preserved and reported for manual review. These are default paths; existing owned Xorg drop-ins, owned hooks, and migrated recovery directories are discovered in place. Integration comments contain content hashes and the original Xorg setting for safe cleanup; they do not cache hardware or ownership status. GUI refresh and status inspection are read-only. Current attachment comes from live VM definitions, device bindings, X11 state, and the owned graphics policy. Temporary locks, rollback records, and destination policy under `/run` protect handoffs; they are not a replacement hardware/status database. Switching jobs run in a transient systemd unit.
 
 The WirePlumber policy excludes the selected displayless GPU's HDMI audio from host audio monitoring. Apply a new policy by logging in again or restarting WirePlumber in the affected session; the latter can briefly interrupt sound.
 

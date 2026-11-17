@@ -24,6 +24,8 @@ class StatelessTests(unittest.TestCase):
         self.core = module('nvidia_handoff_core.py')
         self.app = module('nvidia-handoff')
         self.app.wayland_active = Mock(return_value=False)
+        self.app.cuda_policy = Mock(return_value=None)
+        self.app.set_cuda_policy = Mock()
         self.app.cleanup_launcher = Mock(return_value='No managed application launcher.')
         self.app.tag_guest_driver = Mock()
         self.app.setup_guest_docker = Mock(return_value='Docker skipped.')
@@ -716,7 +718,7 @@ class StatelessTests(unittest.TestCase):
         events.clear()
         self.app.enable_cuda = lambda hook: (self.assertTrue(active), events.append('cuda'))
         self.app.wayland_worker('cuda', h, True)
-        self.assertEqual(events, ['stop', 'park', 'cuda', 'start'])
+        self.assertEqual(events, ['stop', 'cuda', 'start'])
         events.clear()
         config.write_bytes(original)
         h.park.side_effect = self.core.Refuse('Device busy: compositor still running')
@@ -726,33 +728,83 @@ class StatelessTests(unittest.TestCase):
         self.assertEqual(config.read_bytes(), original)
         self.assertTrue((self.root / 'xorg-transition').exists())
 
-    def test_cuda_only_releases_graphics_and_refuses_busy_or_shared_drivers(self):
+    def test_cuda_policy_installs_restores_and_rolls_back(self):
+        app = module('nvidia-handoff')
+        app.CUDA_ENV = self.root / 'environment.d/90-nvidia-handoff.conf'
+        app.CUDA_DM = self.root / 'display-manager.service.d/90-nvidia-handoff.conf'
+        values = {'__GLX_VENDOR_LIBRARY_NAME': 'mesa', 'VK_DRIVER_FILES': '/usr/share/vulkan/icd.d/radeon.json'}
+        app.cuda_environment = Mock(return_value=values)
+        app.run = Mock(side_effect=lambda *args: '1000 user' if 'list-users' in args else '')
+        environment = {'__GLX_VENDOR_LIBRARY_NAME': 'original', 'UNRELATED': 'keep'}
+        def user(uid, action, *args):
+            self.assertEqual(uid, '1000')
+            if action == 'show-environment':
+                return '\n'.join(k + '=' + v for k,v in environment.items())
+            if action == 'set-environment':
+                environment.update(arg.split('=', 1) for arg in args)
+            if action == 'unset-environment':
+                for key in args: environment.pop(key, None)
+            return ''
+        app.user_environment = user
+        with self.owned_paths():
+            app.set_cuda_policy(Mock(), True)
+            self.assertEqual(app.cuda_policy()[0], values)
+            self.assertEqual(environment, {**values, 'UNRELATED': 'keep'})
+            app.set_cuda_policy(Mock(), True)
+            self.assertEqual(app.cuda_policy()[1]['1000']['__GLX_VENDOR_LIBRARY_NAME'], 'original')
+            app.set_cuda_policy(Mock(), False)
+            self.assertFalse(app.CUDA_ENV.exists())
+            self.assertFalse(app.CUDA_DM.exists())
+            self.assertEqual(environment, {'__GLX_VENDOR_LIBRARY_NAME': 'original', 'UNRELATED': 'keep'})
+            attempts = []
+            def fail(uid, action, *args):
+                if action == 'set-environment' and not attempts:
+                    attempts.append(True)
+                    raise app.Error('reload failed')
+                return user(uid, action, *args)
+            app.user_environment = fail
+            with self.assertRaisesRegex(app.Error, 'reload failed'):
+                app.set_cuda_policy(Mock(), True)
+            self.assertFalse(app.CUDA_ENV.exists())
+            self.assertFalse(app.CUDA_DM.exists())
+            self.assertEqual(environment, {'__GLX_VENDOR_LIBRARY_NAME': 'original', 'UNRELATED': 'keep'})
+            app.CUDA_ENV.write_text('administrator data')
+            app.CUDA_ENV.chmod(0o644)
+            with self.assertRaisesRegex(app.Error, 'Unowned'):
+                app.set_cuda_policy(Mock(), True)
+            self.assertEqual(app.CUDA_ENV.read_text(), 'administrator data')
+
+    def test_cuda_environment_selects_primary_mesa_and_vulkan_only(self):
+        app = module('nvidia-handoff')
+        primary = self.device('0000:03:00.0')
+        (primary / 'vendor').write_text('0x1002')
+        (primary / 'boot_vga').write_text('1')
+        app.GPU = self.gpu
+        egl = self.root / 'usr/share/glvnd/egl_vendor.d'
+        vk = self.root / 'usr/share/vulkan/icd.d'
+        egl.mkdir(parents=True); vk.mkdir(parents=True)
+        for path in (egl / '50_mesa.json', egl / '10_nvidia.json', vk / 'radeon_icd.json', vk / 'nvidia_icd.json'):
+            path.write_text('{}')
+        app.Path = lambda value: self.root / str(value).lstrip('/')
+        result = app.cuda_environment(self.core)
+        self.assertEqual(result['DRI_PRIME'], 'pci-0000_03_00_0')
+        self.assertEqual(result['__EGL_VENDOR_LIBRARY_FILENAMES'], str(egl / '50_mesa.json'))
+        self.assertEqual(result['VK_DRIVER_FILES'], str(vk / 'radeon_icd.json'))
+        self.assertNotIn('CUDA_VISIBLE_DEVICES', result)
+        (primary / 'boot_vga').write_text('0')
+        with self.assertRaisesRegex(app.Error, 'primary'):
+            app.cuda_environment(self.core)
+
+    def test_cuda_setup_preserves_running_compute_and_verifies_uvm(self):
         h = Mock()
-        h.shared_nvidia_driver.return_value = False
-        h.module_loaded.return_value = True
-        h.host_nodes.return_value = h.vfio_nodes.return_value = set()
         self.app.restore_host = Mock()
-        self.app.graphics_enabled = Mock(return_value=False)
         self.app.xorg_owners = Mock(return_value=set())
+        h.module_loaded.return_value = True
         self.app.enable_cuda(h)
-        self.assertEqual([c.args for c in h.run.call_args_list], [
-            ('/usr/sbin/modprobe', '-r', 'nvidia_drm'),
-            ('/usr/sbin/modprobe', '-r', 'nvidia_modeset'),
-            ('/usr/sbin/modprobe', 'nvidia_uvm')])
-        h.run.reset_mock()
-        h.idle.side_effect = self.core.Refuse('Device busy')
-        with self.assertRaisesRegex(self.core.Refuse, 'busy'):
-            self.app.enable_cuda(h)
-        h.run.assert_not_called()
-        h.idle.side_effect = None
-        h.shared_nvidia_driver.return_value = True
-        self.app.restore_host.reset_mock()
-        with self.assertRaisesRegex(self.app.Error, 'another NVIDIA'):
-            self.app.enable_cuda(h)
-        self.app.restore_host.assert_not_called()
-        h.shared_nvidia_driver.return_value = False
-        self.app.graphics_enabled.return_value = True
-        with self.assertRaisesRegex(self.app.Error, 'could not be verified'):
+        h.run.assert_called_once_with('/usr/sbin/modprobe', 'nvidia_uvm')
+        h.idle.assert_not_called()
+        h.module_loaded.return_value = False
+        with self.assertRaisesRegex(self.app.Error, 'verified'):
             self.app.enable_cuda(h)
 
     def test_wayland_and_cuda_dispatch_are_distinct(self):
@@ -1143,13 +1195,13 @@ class StatelessTests(unittest.TestCase):
         self.app.GPUWindow.show_inventory(window,[d],False,'vfio-pci')
         self.assertEqual(window.current_target,'vm')
         for uvm in (False, True):
-            self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', uvm)
+            self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', uvm, compute_policy=True)
             self.assertEqual(window.current_target, 'cuda' if uvm else None)
         self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', True, True)
         self.assertIsNone(window.current_target)
         self.app.wayland_active.return_value = True
         for graphics in (False, True):
-            self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', True, graphics)
+            self.app.GPUWindow.show_inventory(window, [], False, 'nvidia', True, graphics, not graphics)
             self.assertEqual(window.current_target, 'wayland' if graphics else 'cuda')
             self.assertIn('cuda', window.rows)
             self.assertIn('wayland', window.rows)

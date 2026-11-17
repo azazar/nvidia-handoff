@@ -221,18 +221,103 @@ def graphics_enabled(h):
     return any(h.beneath(p, h.pci(GPU)) for p in (h.SYS / 'class/drm').glob('card[0-9]*'))
 
 
+CUDA_ENV = Path('/etc/environment.d/90-nvidia-handoff.conf')
+CUDA_DM = Path('/etc/systemd/system/display-manager.service.d/90-nvidia-handoff.conf')
+
+
+def cuda_environment(h):
+    primary = [p for p in h.pci_gpu_devices() if p.name != GPU and h.read_attr(p / 'boot_vga') == '1']
+    if len(primary) != 1 or h.read_attr(primary[0] / 'vendor') not in ('0x1002', '0x8086'):
+        raise Error('CUDA desktop policy requires one identifiable primary AMD or Intel GPU.')
+    vendor = 'radeon' if h.read_attr(primary[0] / 'vendor') == '0x1002' else 'intel'
+    egl = sorted(Path('/usr/share/glvnd/egl_vendor.d').glob('*mesa*.json'))
+    vulkan = sorted(Path('/usr/share/vulkan/icd.d').glob(vendor + '*icd*.json'))
+    if not egl or not vulkan:
+        raise Error('Install the primary GPU Mesa EGL and Vulkan drivers before CUDA-only setup.')
+    return dict(__EGL_VENDOR_LIBRARY_FILENAMES=':'.join(map(str, egl)),
+                __GLX_VENDOR_LIBRARY_NAME='mesa', VK_DRIVER_FILES=':'.join(map(str, vulkan)),
+                VK_ICD_FILENAMES=':'.join(map(str, vulkan)), __NV_PRIME_RENDER_OFFLOAD='0',
+                DRI_PRIME='pci-' + primary[0].name.replace(':', '_').replace('.', '_'))
+
+
+def cuda_policy():
+    if not CUDA_ENV.exists():
+        return None
+    body, original = receipt(CUDA_ENV)
+    if original != 'absent':
+        raise Error('Unowned CUDA desktop policy; preserving it.')
+    lines = body.decode().splitlines()
+    previous = json.loads(lines[0].removeprefix('# previous='))
+    return dict(line.split('=', 1) for line in lines[1:]), previous
+
+
+def user_environment(uid, *args):
+    return run('/usr/bin/systemctl', '--user', '--machine=' + str(uid) + '@.host', *args)
+
+
+def set_cuda_policy(h, enabled):
+    old = cuda_policy()
+    dm = ('[Service]\nEnvironmentFile=-' + str(CUDA_ENV) + '\n').encode()
+    check_managed(CUDA_DM, dm)
+    if CUDA_DM.exists() and receipt(CUDA_DM)[1] != 'absent':
+        raise Error('Unowned display-manager drop-in; preserving it.')
+    users = [line.split()[0] for line in run('/usr/bin/loginctl', 'list-users', '--no-legend', '--no-pager').splitlines()]
+    users = [uid for uid in users if uid.isdigit() and int(uid) >= 1000]
+    values = cuda_environment(h) if enabled else {}
+    previous = old[1] if old else {}
+    snapshots = {p: p.read_bytes() if p.exists() else None for p in (CUDA_ENV, CUDA_DM)}
+    created_dirs = [p.parent for p in snapshots if not p.parent.exists()]
+    environments = {uid: dict(shlex.split(line)[0].split('=', 1) for line in user_environment(uid, 'show-environment').splitlines() if '=' in line) for uid in users}
+    for uid in users:
+        if uid not in previous:
+            previous[uid] = {key: environments[uid].get(key) for key in (values if enabled else old[0] if old else {})}
+    try:
+        if enabled:
+            body = ('# previous=' + json.dumps(previous, sort_keys=True) + '\n' + ''.join(key + '=' + value + '\n' for key, value in values.items())).encode()
+            write_file(CUDA_ENV, marked(body))
+            write_file(CUDA_DM, marked(dm))
+        else:
+            if old:
+                CUDA_ENV.unlink()
+            if CUDA_DM.exists():
+                CUDA_DM.unlink()
+        run('/usr/bin/systemctl', 'daemon-reload')
+        for uid in users:
+            user_environment(uid, 'daemon-reload')
+            restore = values if enabled else {key: previous.get(uid, {}).get(key) for key, value in (old[0] if old else {}).items() if environments[uid].get(key) == value}
+            absent = [key for key, value in restore.items() if value is None]
+            present = [key + '=' + value for key, value in restore.items() if value is not None]
+            if absent:
+                user_environment(uid, 'unset-environment', *absent)
+            if present:
+                user_environment(uid, 'set-environment', *present)
+    except BaseException:
+        for path, content in snapshots.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_file(path, content)
+        for directory in created_dirs:
+            if directory.exists() and not any(directory.iterdir()):
+                directory.rmdir()
+        run('/usr/bin/systemctl', 'daemon-reload')
+        for uid in users:
+            user_environment(uid, 'daemon-reload')
+            keys = set(values) | set(old[0] if old else {})
+            absent = [key for key in keys if key not in environments[uid]]
+            present = [key + '=' + environments[uid][key] for key in keys if key in environments[uid]]
+            if absent:
+                user_environment(uid, 'unset-environment', *absent)
+            if present:
+                user_environment(uid, 'set-environment', *present)
+        raise
+
+
 def enable_cuda(h):
-    if h.shared_nvidia_driver():
-        raise Error('CUDA-only mode cannot disable graphics while another NVIDIA GPU shares the driver.')
     restore_host(h)
-    h.display_idle()
-    h.idle(h.host_nodes() | h.vfio_nodes())
-    for module in ('nvidia_drm', 'nvidia_modeset'):
-        if h.module_loaded(module):
-            h.run('/usr/sbin/modprobe', '-r', module)
     h.run('/usr/sbin/modprobe', 'nvidia_uvm')
-    if not h.module_loaded('nvidia_uvm') or graphics_enabled(h) or xorg_owners(h):
-        raise Error('CUDA-only mode could not be verified; graphics must be released and UVM loaded.')
+    if not h.module_loaded('nvidia_uvm') or xorg_owners(h):
+        raise Error('CUDA-only mode could not be verified; UVM must be loaded and Xorg released.')
 
 
 def wayland_active():
@@ -241,6 +326,15 @@ def wayland_active():
 
 def wayland_worker(mode, h, allow_logout):
     if mode == 'connect':
+        if cuda_policy():
+            if not allow_logout:
+                raise Error('Leaving CUDA-only requires confirmed logout.')
+            manager = h.display_manager()
+            h.run('/usr/bin/systemctl', 'stop', manager)
+            try:
+                set_cuda_policy(h, False)
+            finally:
+                h.run('/usr/bin/systemctl', 'start', manager)
         with locked(h):
             restore_host(h)
             h.run('/usr/sbin/modprobe', 'nvidia_drm')
@@ -261,6 +355,8 @@ def wayland_worker(mode, h, allow_logout):
     # Stop/start outside the GPU lock: login-manager dependencies can call libvirt.
     try:
         h.run('/usr/bin/systemctl', 'stop', manager)
+        if mode == 'cuda' or cuda_policy():
+            set_cuda_policy(h, mode == 'cuda')
         with locked(h):
             original = CONFIG.read_bytes()
             text, count = re.subn(r'(?im)^(\s*Option\s+"AutoAddGPU"\s+")(?:off|on)("\s*)$',
@@ -271,9 +367,10 @@ def wayland_worker(mode, h, allow_logout):
                 if text.encode() != original:
                     atomic_config(text.encode())
                 marker.unlink()  # Still locked; park performs all busy/rollback checks.
-                h.park()
                 if mode == 'cuda':
                     enable_cuda(h)
+                else:
+                    h.park()
             except BaseException:
                 marker.write_text('wayland-disconnect\n')
                 marker.chmod(0o600)
@@ -291,12 +388,16 @@ def worker(mode, preserve_policy=False, allow_logout=False):
     ensure_integration(xorg=not wayland_active() or mode != 'connect')
     h.assert_display()
     require_stopped()  # Libvirt query OUTSIDE the GPU lock.
-    if wayland_active():
+    if wayland_active() or mode == 'cuda':
         wayland_worker(mode, h, allow_logout)
         if not preserve_policy:
             with locked(h):
                 h.choose_target('wayland' if mode == 'connect' else 'cuda' if mode == 'cuda' else None)
         return
+    if cuda_policy():
+        if not allow_logout:
+            raise Error('Leaving CUDA-only requires confirmed logout.')
+        set_cuda_policy(h, False)
     fd = h.lock()
     marker = h.STATE_DIR / 'xorg-transition'
     original = None
@@ -377,6 +478,8 @@ def launch(command):
     if not wayland_active():
         load_hook().assert_display(need_display=True)
     require_stopped()
+    if cuda_policy():
+        raise Error('Select Xorg or Wayland before launching NVIDIA graphics; CUDA-only is active.')
     if pci_driver(GPU) != 'nvidia':
         raise Error('GPU is not attached to the host; connect it first.')
     if load_hook().shared_nvidia_driver():
@@ -853,7 +956,7 @@ def inventory(check_drivers=False):
 
 def destination_rows(records):
     rows = [('none', 'None', 'Idle GPU', 'Leave GPU idle, without a VM or Xorg', True),
-            ('cuda', 'CUDA only', 'Compute', 'NVIDIA + UVM, without Xorg or Wayland graphics', True),
+            ('cuda', 'CUDA only', 'Compute', 'NVIDIA compute; desktop graphics use the primary GPU', True),
             ('xorg', 'Xorg', 'Host gaming', 'NVIDIA PRIME; requires an X11 session', not wayland_active())]
     if wayland_active():
         rows.append(('wayland', 'Wayland', 'Host gaming', 'NVIDIA DRM rendering; compositor chooses its GPU', True))
@@ -898,8 +1001,8 @@ def operation_plan(target, records, xorg_attached):
     if any(d['state'] != 'running' for d in stops):
         raise Error('First shut down the paused or transitioning GPU-owning VM manually.')
     if wayland_active():
-        return stops, target != 'wayland' and (target == 'cuda' or pci_driver(GPU) == 'nvidia' or bool(stops))
-    return stops, (target == 'xorg' and not xorg_attached) or (target != 'xorg' and xorg_attached)
+        return stops, bool(cuda_policy()) or (target != 'wayland' and (target == 'cuda' or pci_driver(GPU) == 'nvidia' or bool(stops)))
+    return stops, target == 'cuda' or bool(cuda_policy()) or (target == 'xorg' and not xorg_attached) or (target != 'xorg' and xorg_attached)
 
 
 def operation_status(h, job, state, message, target):
@@ -965,11 +1068,9 @@ def selection_worker(target, job, shutdown, restart, prepare_vm=False, setup_dri
             gaming = target == 'xorg'
             if not wayland and (h.xorg_mode() != ('on' if gaming else 'off') or bool(xorg_owners(h)) != gaming) and not restart:
                 raise Error('Xorg state changed; confirm graphical logout before retrying.')
-            worker('connect' if gaming or target == 'wayland' else 'cuda' if wayland and target == 'cuda' else 'disconnect', preserve_policy=True, allow_logout=restart)
+            worker('connect' if gaming or target == 'wayland' else 'cuda' if target == 'cuda' else 'disconnect', preserve_policy=True, allow_logout=restart)
             if target in ('cuda', 'xorg', 'wayland'):
                 with locked(h):
-                    if target == 'cuda' and not wayland:
-                        enable_cuda(h)
                     h.choose_target(target)
                 operation_status(h, job, 'done', 'GPU attached to ' + ('Wayland.' if target == 'wayland' else 'Xorg. Sign in again to launch games.' if gaming else 'CUDA only.'), target)
                 return
@@ -1074,7 +1175,7 @@ def configure_gui_style(root):
 
 
 def row_summary(row, current=None):
-    summaries = {'none': 'VFIO, unattached', 'cuda': 'NVIDIA + UVM, no graphics', 'wayland': 'NVIDIA DRM rendering',
+    summaries = {'none': 'VFIO, unattached', 'cuda': 'CUDA; graphics on primary GPU', 'wayland': 'NVIDIA DRM rendering',
                  'xorg': 'PRIME, primary desktop GPU'}
     if row[0] == current and current in summaries:
         return {'none': 'Current · idle GPU', 'cuda': 'GPU attached · CUDA',
@@ -1297,12 +1398,12 @@ class GPUWindow:
                 records = inventory(check_drivers=True)
                 h, driver = load_hook(), pci_driver(GPU)
                 attached = not wayland_active() and driver == 'nvidia' and not h.shared_nvidia_driver() and bool(nvidia_provider(providers()))
-                self.messages.put(('inventory', records, attached, driver, h.module_loaded('nvidia_uvm'), graphics_enabled(h)))
+                self.messages.put(('inventory', records, attached, driver, h.module_loaded('nvidia_uvm'), graphics_enabled(h), bool(cuda_policy())))
             except Exception as exc:
                 self.messages.put(('error', str(exc)))
         threading.Thread(target=fetch, daemon=True).start()
 
-    def show_inventory(self, records, attached, driver, uvm=False, graphics=False):
+    def show_inventory(self, records, attached, driver, uvm=False, graphics=False, compute_policy=False):
         self.refreshing = False
         self.records = records
         self.attached = attached
@@ -1314,8 +1415,8 @@ class GPUWindow:
             self.current.set('Current attachment: Xorg — NVIDIA gaming, desktop on the primary GPU')
             current = 'xorg'
         elif driver == 'nvidia':
-            current = 'wayland' if wayland_active() and graphics else 'host' if graphics else 'cuda'
-            self.current.set('Current attachment: ' + ('Wayland — NVIDIA graphics available' if current == 'wayland' else 'host NVIDIA — graphics enabled' if graphics else 'CUDA only' if uvm else 'host NVIDIA — CUDA UVM not loaded'))
+            current = 'cuda' if compute_policy else 'wayland' if wayland_active() and graphics else 'host'
+            self.current.set('Current attachment: ' + ('Wayland — NVIDIA graphics available' if current == 'wayland' else 'CUDA only — desktop graphics policy active' if compute_policy and uvm else 'host NVIDIA — CUDA desktop policy not active'))
         else:
             self.current.set('Current attachment: ' + ('none — idle GPU on VFIO' if driver == 'vfio-pci' else 'host; not attached to Xorg'))
             current = 'none'
@@ -1859,7 +1960,7 @@ def cleanup(args):
     integrations = {}
     original_mode = None
     suffix = GPU.replace(':', '_').replace('.', '_')
-    candidates = [CONFIG, Path(SETTINGS['hook_path'])]
+    candidates = [CONFIG, Path(SETTINGS['hook_path']), CUDA_ENV, CUDA_DM]
     candidates.extend(Path('/etc/wireplumber') / folder / ('51-nvidia-handoff-' + suffix + ext)
                       for folder, ext in (('wireplumber.conf.d', '.conf'), ('main.lua.d', '.lua')))
     for path in candidates:
@@ -1937,10 +2038,15 @@ def cleanup(args):
             data = re.sub(rb'(?im)^(\s*Option\s+"AutoAddGPU"\s+")(?:on|off)("\s*)$',
                           lambda m: m[1] + original_mode.encode() + m[2], body)
             write_file(CONFIG, data, stat.S_IMODE(CONFIG.stat().st_mode))
+        os.close(fd)
+        fd = None
+        if cuda_policy():
+            set_cuda_policy(h, False)
+        fd = h.lock(cleaning=True)
         print(cleanup_launcher(dry_run=False), flush=True)
         # Removing the program invalidates queued workers before the lock disappears.
         remove_files(files, directories)
-        for parent in {Path(name).parent for name in integrations if name.startswith('/etc/wireplumber/')} :
+        for parent in {Path(name).parent for name in integrations if name.startswith('/etc/wireplumber/') or Path(name) in (CUDA_ENV, CUDA_DM)}:
             if parent.exists() and not parent.is_symlink() and not any(parent.iterdir()):
                 parent.rmdir()
         for path in h.STATE_DIR.iterdir():
